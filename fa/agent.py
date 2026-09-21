@@ -76,15 +76,36 @@ class Session:
 
     `on_event` 是可选的过程监听器，收到的是 events.py 里那几种 dict。
     不传就是「只关心最终答案」—— 测试和第七天的评测都这样用。
+
+    `tools` / `system_prompt` / `max_steps` 都可以覆盖，这是给**子 agent** 用的
+    （见 workflow.py）。子 agent 和主 agent 走的是**同一个循环**，只是工具集更小、
+    提示词不同、步数上限更低 —— 复用而不是另写一个循环，是因为那条「每个
+    tool_call 恰好一条 ToolMessage」的不变量只该有一份实现。
     """
 
-    def __init__(self, confirm=None, on_event=None):
+    def __init__(
+        self,
+        confirm=None,
+        on_event=None,
+        *,
+        tools=None,
+        system_prompt: str | None = None,
+        max_steps: int | None = None,
+        model=None,
+    ):
         self.messages: list = []
         self._on_event = on_event
-        self._model = None
+        # 传了模型就用它，不传就懒构造（key 没配好时，错误只在真正要用的时候
+        # 才暴露）。测试和子 agent 都从这里注入。
+        self._model = model
         self._prompt_fingerprint: str | None = None
 
-        self.tools = build_tools(confirm)
+        # 固定提示词：设了就不每轮重渲染（子 agent 的提示词只由任务决定，
+        # 和 skill 清单、记忆都无关）。
+        self._fixed_prompt = system_prompt
+        self._max_steps = max_steps or MAX_STEPS
+
+        self.tools = build_tools(confirm) if tools is None else list(tools)
         self.tool_map = {t.name: t for t in self.tools}
 
     # ------------------------------------------------------------------
@@ -140,9 +161,9 @@ class Session:
         命中缓存，每轮都动 system message 会让整段对话的缓存失效。
 
         真正会变的输入只有 skill 清单（每轮重扫，所以 agent 刚写完的
-        SKILL.md 下一轮自己就能用上）。清单没变就一次替换都不做。
+        SKILL.md 下一轮自己就能用上）和记忆。清单没变就一次替换都不做。
         """
-        rendered = build_system_prompt(discover(), _memories())
+        rendered = self._fixed_prompt or build_system_prompt(discover(), _memories())
         if rendered == self._prompt_fingerprint:
             return False
 
@@ -228,7 +249,7 @@ class Session:
         checkpoint = len(self.messages)
         self.messages.append(HumanMessage(text))
 
-        for step in range(1, MAX_STEPS + 1):
+        for step in range(1, self._max_steps + 1):
             self._emit({"type": STEP_START, "step": step})
 
             try:
@@ -274,7 +295,7 @@ class Session:
         # 步数用完。此刻每条 tool_call 都已经有应答，历史是合法的 ——
         # 不需要（也不该）伪造一条 assistant 消息，直接告诉用户就行。
         return self._fail(
-            f"已经连续做了 {MAX_STEPS} 步还没有收敛，先停在这里。\n"
+            f"已经连续做了 {self._max_steps} 步还没有收敛，先停在这里。\n"
             f"把任务拆小一点，或者直接告诉我下一步该看什么。"
         )
 
