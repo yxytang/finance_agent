@@ -39,6 +39,12 @@ Money = Decimal
 CENT = Decimal("0.01")
 ZERO = Decimal("0")
 
+# 还没分类的交易在分组和展示时用的名字。
+# 它不是 CATEGORIES 里的一员 —— CATEGORIES 是分类器要选的**目标**，
+# 这个是「还没做出选择」的状态。混在一起的话，分类评测会把它当成一个
+# 可以被预测的类目，然后算出一个毫无意义的 per-class 分数。
+UNCATEGORIZED = "未分类"
+
 
 def money(value) -> Money:
     """把外部输入变成金额。**先转字符串**，理由见模块 docstring。"""
