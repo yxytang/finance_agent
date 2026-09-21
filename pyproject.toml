@@ -1,3 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# 只打包 fa —— data/ 是脚本目录（`python -m data.generate`），不是要装的东西。
+# 测试从仓库根跑，靠下面的 pythonpath 找到它。
+[tool.setuptools]
+packages = ["fa", "fa.tools"]
+
 [project]
 name = "finance-agent"
 version = "0.1.0"
