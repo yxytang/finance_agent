@@ -253,25 +253,36 @@ def corpus_fingerprint(root: Path) -> str:
 
     **指纹里必须带上分词方案本身**（`SCHEME`）。否则改了分词逻辑之后，语料文件
     一个字节没动，指纹不变，于是索引永远不重建 —— 而检索结果会静默地变错。
-    这是那种「改了代码、测试全绿、线上悄悄不对」的经典场景。
+    这类「改了代码、测试全绿、线上悄悄不对」的场面，正是这个检查要防的。
 
-    只记**文件名、大小、修改时间**，不读内容：目录一大，读内容的代价会超过
-    重建索引本身，那这个检查就比它要防的问题还贵。
+    ## 为什么读内容，而不是只看修改时间
 
-    修改时间用 `st_mtime_ns` 而不是 `st_mtime`。秒级精度不够：同一秒内改了
-    一个**长度没变**的文件（改了个错别字、换了个词），指纹纹丝不动，索引就
-    不会重建，而检索会继续用旧内容 —— 又是那种没有症状的失败。
+    一开始用的是「文件名 + 大小 + 修改时间」，理由是读内容太贵，而 stat 很便宜。
+    那个优化是**错的**，而且错得不容易发现：
+
+        同一秒（更准确地说，同一个文件系统时间戳 tick）内改一个长度不变的文件，
+        大小和修改时间都不变 —— 指纹纹丝不动，索引不重建。
+
+    这不是理论问题：`test_fingerprint_changes_when_the_corpus_changes` 就是这么
+    红的，而且它是**间歇性**红的 —— 两次写盘恰好落在同一个 tick 里才复现。
+
+    教训是：**这个检查存在的全部意义就是「不漏掉变化」。** 一个会漏的检查比没有
+    检查更糟（你会以为它兜住了）。所以宁可读内容 —— 一份几十个文件的语料，
+    读一遍是毫秒级的事，而漏一次的代价是检索持续返回旧结果且毫无症状。
+
+    真要优化的话，该优化的是调用方（别每次查询都重算），而不是把正确性换掉。
     """
-    parts = [SCHEME]
+    digest = hashlib.sha1(SCHEME.encode("utf-8"))
     for path in sorted(root.rglob("*.md")):
         try:
-            stat = path.stat()
+            content = path.read_bytes()
         except OSError:
             continue
-        parts.append(
-            f"{path.relative_to(root).as_posix()}:{stat.st_size}:{stat.st_mtime_ns}"
-        )
-    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def load_or_build(root: Path, path: Path) -> SearchIndex:

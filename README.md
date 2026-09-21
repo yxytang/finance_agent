@@ -2,7 +2,7 @@
 
 个人财务分析 agent —— 自然语言问题进去，**可复现的数字**出来。
 
-> 九天推进中。当前 **Day 7**。
+> 九天推进中。当前 **Day 8**。
 
 ## 三条设计原则
 
@@ -51,6 +51,7 @@ fa> 2026 年 7 月一共花了多少钱？
 | `list_subscriptions` | 固定扣款清单，按**年化**金额排序 |
 | `search_knowledge` | 查财务知识库（政策、规则、概念） |
 | `investigate` | 派一个子助手做**上下文隔离**的深挖，只把结论带回来 |
+| `ledger__*` | 3 个**通过 MCP** 从外部进程取的工具，见下 |
 | `correct_category` | 纠正某个商户的类目（写缓存 + 写记忆，改前会问一句） |
 | `remember` | 记下一条长期有用的信息，跨会话保留 |
 | `use_skill` | 加载 skill 正文，或读它附带的参考文件 |
@@ -170,6 +171,62 @@ python -m eval.delegation
 
 第一步明确写「不要派」：那一步的结果主 agent 自己已经看到了，派出去等于把
 它查的东西又隔离掉，还得再问一遍。实测模型照做了。
+
+## MCP：自己写一个 server
+
+`mcp_server/ledger_server.py` 把账单包成一个 MCP server，`fa/mcp/` 是**手写的**
+JSON-RPC 客户端（不装 SDK）。`/mcp` 可以现场看一遍握手：
+
+```
+fa> /mcp
+  服务端：ledger 0.1.0
+  协商到协议版本：2024-11-05
+  运行时发现 3 个工具：
+  list_accounts          （无参数）
+  list_merchants         limit
+  fetch_transactions     date_from, date_to, account, limit
+```
+
+三步：`initialize` 能力协商 → `tools/list` 发现 → `tools/call` 调用。
+**工具是运行时读到的，不是编译进客户端的** —— 换一个 server、加一个工具，
+客户端一行都不用改。这就是它比「每家自己写 plugin」强的地方。
+
+### 独立进程让边界变成真的
+
+在同一个进程里，「不把金额发给 LLM」只是一句约定 —— 任何一处忘了检查就漏了，
+而且没有症状。跨进程之后，**server 不返回的东西，agent 拿不到**，不是「不该拿」。
+
+`list_merchants` 就是这条边界的执行点：归类只需要商户串，所以它就只给商户串。
+测试直接钉住这一点（`tests/test_mcp.py`）：
+
+```python
+assert not re.search(r"\d+\.\d{2}", out)          # 没有金额
+assert not re.search(r"\d{4}-\d{2}-\d{2}", out)   # 没有日期
+assert "credit" not in out and "checking" not in out  # 没有账户
+```
+
+### 它不是内置工具的重复
+
+`fetch_transactions` 填的是一个**真实空缺**：内置的 `query_transactions` 只能
+聚合（合计/笔数/分组），**列不出原始明细**。实测问「把 2026-03-14 那天的交易
+逐笔列出来」，模型正确地走了 `ledger__fetch_transactions`，而且顺手发现了
+那天的一笔重复扣款 —— 那是 Day 1 埋在数据里的坑。
+
+### 两个传输层的坑
+
+**stdout 是协议通道**，server 里一个多余的 `print` 就会把协议搅坏 —— 混进去的
+那行会被当成 JSON-RPC 消息解析，表现为「server 忽然不响应了」。所以调试输出
+一律走 stderr。
+
+**stderr 不能接管道而不读**：服务端写满管道缓冲区就会阻塞在写 stderr 上，
+而客户端在等它的 stdout —— 双方互相等，死锁。客户端让 stderr 直接继承，
+顺带日志直接打在控制台上。
+
+## 还没做的
+
+- `import_csv` 那个工具**没做**，是有意的：那意味着接受一个**文件路径**参数的
+  工具，而这个项目的设计是模型永远不提供路径（见下面「已经定下来的设计」）。
+  数据从哪来是部署时的事，不是运行时由模型决定的事。
 
 ## 交易分类：三层，而且都被量过
 
@@ -350,7 +407,7 @@ python -m pytest -q
 | 4 | 分类三层 + Memory | ✅ |
 | 5 | 检索（RAG）+ 财务知识库 | ✅ |
 | 6 | Agent 工作流 + 子 agent | ✅ |
-| 7 | MCP：自己写一个 server | — |
+| 7 | MCP：自己写一个 server | ✅ |
 | 8 | RAGAS 评测 | — |
 | 9 | Web 前后端 + 部署 | — |
 

@@ -44,11 +44,38 @@ HELP = """命令：
   /skills      列出发现到的 skill，并显示清单占多少字节
   /categories  列出固定类目表
   /memory      查看记住的事；/memory rm N 删掉第 N 条
+  /mcp         看一眼外部 MCP server 的协议握手和它暴露的工具
   /reset       清空对话历史（上下文快满时用）
   /exit        退出
 
 其余输入都会交给 agent 处理。
 """
+
+
+def cmd_mcp() -> None:
+    """现场跑一遍 MCP 的三步握手。
+
+    刻意**新起一个连接**而不是复用手上那一个：这条命令的用处就是让人看见
+    「工具是**运行时发现**的」这件事。复用的话只能看到一份已经挂好的列表，
+    看不到发现的过程，而那才是协议的价值所在。
+    """
+    from fa.mcp import MCPError, ledger_client
+    from fa.mcp.client import describe_tools
+
+    try:
+        with ledger_client() as client:
+            info = client.initialize()
+            tools = client.list_tools()
+    except MCPError as exc:
+        print(f"  连不上：{exc}")
+        return
+
+    server = info.get("serverInfo", {})
+    print(f"  服务端：{server.get('name')} {server.get('version')}")
+    print(f"  协商到协议版本：{info.get('protocolVersion')}")
+    print(f"  运行时发现 {len(tools)} 个工具：")
+    print(describe_tools(tools))
+    print("\n  （它们已经挂在你手上了，名字带 ledger__ 前缀。）")
 
 
 def cmd_memory(arg: str) -> None:
@@ -128,6 +155,8 @@ def handle_command(line: str, session: Session) -> bool:
     elif command == "memory":
         _, _, rest = line[1:].partition(" ")
         cmd_memory(rest)
+    elif command == "mcp":
+        cmd_mcp()
     elif command == "reset":
         session.reset()
         print("  对话历史已清空。")
