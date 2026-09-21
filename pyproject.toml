@@ -1,0 +1,22 @@
+[project]
+name = "finance-agent"
+version = "0.1.0"
+description = "个人财务分析 agent —— 自然语言问题进去，可复现的数字出来"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain",
+    "langchain-openai",
+    "python-dotenv",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+# 第八天的 RAGAS 单独列，因为它会带进 datasets / pyarrow / numpy 一串重依赖，
+# 而日常开发和 CI 完全用不到 —— 装它会白白拖慢 CI。
+eval = ["ragas"]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,20 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.idea/
+.vscode/
+
+# 真 key 放这里，绝不提交
+.env
+
+# 运行时产物：分类缓存、BM25 索引、跨会话记忆都落在这几个目录。
+# 它们由代码生成、可以重建，而且记忆里可能有用户的私人内容。
+data/category_cache.json
+knowledge/.index/
+memory/*.md
+
+# 注意：data/transactions.csv 和 data/reference.csv **要提交**。
+# 别人 clone 下来一条命令就能跑，不用先自己生成一遍。

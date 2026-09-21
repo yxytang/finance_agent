@@ -1,0 +1,158 @@
+"""合成账单生成器。
+
+这里钉的是两条**地基性质**：
+
+  1. **确定性** —— 换个种子数据就变、同一句话跑两次结果不一样，那
+     findings.md 里的分数第二天就复现不出来了，它也就不是评测集了。
+  2. **6 个坑真的在数据里** —— 后面所有异常检测的评测都拿它们当真值。
+     坑没了而没人发现，评测会「全过」，那比失败更糟。
+"""
+
+from collections import Counter
+
+import pytest
+
+from data.generate import build, check_traps, write_csv, write_reference
+from fa.config import CATEGORIES
+
+RENT = "PACIFIC PROPERTY MGMT RENT"
+
+
+@pytest.fixture(scope="module")
+def bill():
+    """整个模块共用一份 —— 生成 1000 多笔不便宜，而它又是只读的。"""
+    return build()
+
+
+# --- 确定性 -------------------------------------------------------------
+
+
+def test_same_seed_gives_the_same_bill():
+    a, ref_a = build()
+    b, ref_b = build()
+
+    assert [t.txn_id for t in a] == [t.txn_id for t in b]
+    assert [t.date for t in a] == [t.date for t in b]
+    assert [t.amount for t in a] == [t.amount for t in b]
+    assert ref_a == ref_b
+
+
+def test_different_seed_gives_a_different_bill():
+    """种子要是根本没接上，上一个测试也会通过 —— 这条防的是那个。"""
+    a, _ = build()
+    b, _ = build(seed=1)
+    assert [t.amount for t in a] != [t.amount for t in b]
+
+
+# --- 6 个坑 -------------------------------------------------------------
+
+
+def test_all_six_traps_are_present(bill):
+    transactions, reference = build()
+
+    results = check_traps(transactions, reference)
+
+    assert len(results) == 6
+    missing = [name for name, ok, _ in results if not ok]
+    assert not missing, f"这些坑不在数据里了：{missing}"
+
+
+def test_trap_check_can_actually_fail():
+    """反查本身要能红。
+
+    一个永远返回「全部通过」的检查比没有检查更糟 —— 它给人虚假的安全感。
+    这里把数据挖空，确认它真的会报出来。
+    """
+    results = check_traps([], {})
+    assert len(results) == 6
+    assert not any(ok for _, ok, _ in results)
+
+
+def test_trap_six_does_not_depend_on_a_lucky_draw(bill):
+    """坑 6 的两个端点是**写死**的。
+
+    第一版把它交给随机金额去碰，结果调了一下购物频次、RNG 流跟着变，
+    金额跨度从 12× 掉到 6.7×，坑就没了 —— 而且没有任何测试会红。
+    """
+    transactions, reference = build()
+    _, ok, detail = check_traps(transactions, reference)[5]
+    assert ok, detail
+
+
+# --- 数据形状 -----------------------------------------------------------
+
+
+def test_size_and_span(bill):
+    transactions, _ = bill
+
+    assert 900 <= len(transactions) <= 1300
+    assert str(transactions[0].date).startswith("2025-")
+    assert str(transactions[-1].date).startswith("2026-")
+
+
+def test_covers_twelve_months_with_no_gap(bill):
+    """每个月都得有交易 —— 空月份会让「按月分组」的测试碰到一个不存在的桶，
+    而那种失败看起来像查询 bug，其实怪数据。"""
+    transactions, _ = bill
+
+    months = Counter(t.year_month for t in transactions)
+
+    assert len(months) == 12
+    assert min(months.values()) > 0
+
+
+def test_monthly_items_appear_in_every_month(bill):
+    transactions, _ = bill
+    every_month = {t.year_month for t in transactions}
+
+    rent = [t for t in transactions if t.merchant == RENT]
+
+    assert len(rent) == 12
+    assert {t.year_month for t in rent} == every_month
+
+
+def test_true_categories_come_from_the_fixed_list(bill):
+    """真值类目掺进一个「伙食费」，分类评测的 per-class 表就会多出一行
+    谁也不认识的类目。"""
+    _, reference = bill
+    assert set(reference.values()) <= set(CATEGORIES)
+
+
+def test_transactions_carry_no_category(bill):
+    """transactions.csv 是给 agent 的**输入**，带上答案就等于泄题。"""
+    transactions, _ = bill
+    assert all(t.category is None for t in transactions)
+
+
+def test_txn_ids_are_unique_and_ordered(bill):
+    transactions, reference = bill
+
+    ids = [t.txn_id for t in transactions]
+
+    assert len(set(ids)) == len(ids)
+    assert ids == sorted(ids)
+    assert set(ids) == set(reference)
+
+
+# --- 落盘 ---------------------------------------------------------------
+
+
+def test_write_csv_does_not_leak_the_answer(tmp_path, bill):
+    transactions, _ = bill
+    path = tmp_path / "transactions.csv"
+
+    write_csv(transactions, path)
+
+    header = path.read_text(encoding="utf-8").splitlines()[0]
+    assert "category" not in header
+    assert header.split(",") == ["txn_id", "date", "merchant", "amount", "account"]
+
+
+def test_reference_covers_every_transaction(tmp_path, bill):
+    transactions, reference = bill
+    path = tmp_path / "reference.csv"
+
+    write_reference(reference, path)
+
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == len(transactions) + 1  # 表头
