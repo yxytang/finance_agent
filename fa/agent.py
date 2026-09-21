@@ -20,6 +20,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from fa.config import MAX_STEPS, build_model
 from fa.events import ANSWER, ERROR, STEP_START, TOOL_CALL, TOOL_RESULT
+from fa.memory import load as load_memories
 from fa.prompt import build_system_prompt
 from fa.skills import discover
 from fa.tools import build_tools
@@ -54,6 +55,20 @@ def _is_content_filtered(ai_message) -> bool:
     """
     metadata = getattr(ai_message, "response_metadata", None) or {}
     return metadata.get("finish_reason") == "content_filter"
+
+
+def _memories():
+    """读跨会话记忆。
+
+    从 config **在调用时**读路径，理由和 skills 一样：测试要能把记忆换到临时
+    目录，import 时的快照换不动。
+
+    每次重渲染 system prompt 都会重读 —— 用户刚说「记住…」时，下一轮就能在
+    prompt 里看到，不用重启。
+    """
+    from fa import config
+
+    return load_memories(config.MEMORY_FILE)
 
 
 class Session:
@@ -127,7 +142,7 @@ class Session:
         真正会变的输入只有 skill 清单（每轮重扫，所以 agent 刚写完的
         SKILL.md 下一轮自己就能用上）。清单没变就一次替换都不做。
         """
-        rendered = build_system_prompt(discover())
+        rendered = build_system_prompt(discover(), _memories())
         if rendered == self._prompt_fingerprint:
             return False
 

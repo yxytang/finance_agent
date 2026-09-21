@@ -26,6 +26,10 @@ TRANSACTIONS_CSV = DATA_DIR / "transactions.csv"
 REFERENCE_CSV = DATA_DIR / "reference.csv"
 CATEGORY_CACHE = DATA_DIR / "category_cache.json"
 
+# 跨会话记忆。放在 memory/ 而不是 data/：前者是「agent 知道的关于用户的事」，
+# 后者是「用户的账单数据」。混在一起之后，清理账单和清理记忆就分不开了。
+MEMORY_FILE = MEMORY_DIR / "facts.md"
+
 # 固定类目表。**必须固定**，不能让模型自由生成 —— 类目一变，per-class
 # precision/recall 就没法算了，第八天的分类评测也就无从谈起。
 CATEGORIES = (

@@ -41,6 +41,16 @@ CATEGORIZED_BILL = tuple(
 )
 
 
+
+def fixed(bill):
+    """工具要的是**取数函数**而不是数据本身。
+
+    传函数是为了让用户纠正分类之后能重读账单（见 `_util.reload_bill`）。
+    测试里不需要那个能力，给个永远返回同一份的函数就行。
+    """
+    return lambda: bill
+
+
 def tool(tools, name):
     return next(t for t in tools if t.name == name)
 
@@ -49,7 +59,7 @@ def tool(tools, name):
 
 
 def test_describe_data_reports_the_facts():
-    out = tool(build_query_tools(UNCATEGORIZED_BILL), "describe_data").invoke({})
+    out = tool(build_query_tools(fixed(UNCATEGORIZED_BILL)), "describe_data").invoke({})
 
     assert "2026-01-05" in out and "2026-02-14" in out
     assert "4" in out  # 笔数
@@ -63,7 +73,7 @@ def test_describe_data_warns_when_nothing_is_categorized():
     不报的话，模型按类目查会拿到 0，然后告诉用户「你这个月没喝咖啡」——
     而用户没有任何办法察觉这句话是错的。
     """
-    out = tool(build_query_tools(UNCATEGORIZED_BILL), "describe_data").invoke({})
+    out = tool(build_query_tools(fixed(UNCATEGORIZED_BILL)), "describe_data").invoke({})
     assert "0 / 4" in out
     assert "还没分类" in out
 
@@ -71,19 +81,19 @@ def test_describe_data_warns_when_nothing_is_categorized():
 def test_describe_data_is_quiet_once_categorized():
     """覆盖率是**算出来的**。写死成「还没分类」的话，第四天分类跑完它就变成
     一句谎话，而谎话比没话说更糟 —— 它看起来仍然可信。"""
-    out = tool(build_query_tools(CATEGORIZED_BILL), "describe_data").invoke({})
+    out = tool(build_query_tools(fixed(CATEGORIZED_BILL)), "describe_data").invoke({})
     assert "⚠️" not in out
 
 
 def test_describe_data_on_an_empty_bill():
-    assert "空" in tool(build_query_tools(()), "describe_data").invoke({})
+    assert "空" in tool(build_query_tools(fixed(())), "describe_data").invoke({})
 
 
 # --- query_transactions -------------------------------------------------
 
 
 def test_query_renders_the_conditions_and_the_number():
-    out = tool(build_query_tools(CATEGORIZED_BILL), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(CATEGORIZED_BILL)), "query_transactions").invoke(
         {"date_from": "2026-01-01", "date_to": "2026-01-31", "agg": "sum"}
     )
 
@@ -93,7 +103,7 @@ def test_query_renders_the_conditions_and_the_number():
 
 
 def test_query_groups_render_as_a_table():
-    out = tool(build_query_tools(CATEGORIZED_BILL), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(CATEGORIZED_BILL)), "query_transactions").invoke(
         {"group_by": "category"}
     )
 
@@ -105,7 +115,7 @@ def test_query_groups_render_as_a_table():
 
 def test_group_by_month_says_it_sorted_by_time():
     """排序规则不同，得说出来 —— 否则模型会以为商户榜也是按时间排的。"""
-    out = tool(build_query_tools(CATEGORIZED_BILL), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(CATEGORIZED_BILL)), "query_transactions").invoke(
         {"group_by": "month"}
     )
     assert "时间" in out
@@ -113,7 +123,7 @@ def test_group_by_month_says_it_sorted_by_time():
 
 def test_count_agg_does_not_repeat_the_number():
     """问「点了几次」时，命中笔数就是答案，不该再说一遍「结果：2 笔」。"""
-    out = tool(build_query_tools(CATEGORIZED_BILL), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(CATEGORIZED_BILL)), "query_transactions").invoke(
         {"agg": "count"}
     )
     assert out.count("4") == 1
@@ -121,7 +131,7 @@ def test_count_agg_does_not_repeat_the_number():
 
 def test_count_is_rendered_without_decimals():
     """「4.00 笔」会让读到它的人怀疑整个结果的可靠程度。"""
-    out = tool(build_query_tools(CATEGORIZED_BILL), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(CATEGORIZED_BILL)), "query_transactions").invoke(
         {"agg": "count", "group_by": "category"}
     )
     assert ".00 笔" not in out
@@ -131,7 +141,7 @@ def test_count_is_rendered_without_decimals():
 
 
 def test_unknown_category_returns_a_string_not_an_exception():
-    out = tool(build_query_tools(CATEGORIZED_BILL), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(CATEGORIZED_BILL)), "query_transactions").invoke(
         {"categories": ["伙食费"]}
     )
 
@@ -141,7 +151,7 @@ def test_unknown_category_returns_a_string_not_an_exception():
 
 
 def test_unparseable_date_returns_a_string():
-    out = tool(build_query_tools(CATEGORIZED_BILL), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(CATEGORIZED_BILL)), "query_transactions").invoke(
         {"date_from": "去年三月"}
     )
 
@@ -150,7 +160,7 @@ def test_unparseable_date_returns_a_string():
 
 
 def test_reversed_range_returns_a_string():
-    out = tool(build_query_tools(CATEGORIZED_BILL), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(CATEGORIZED_BILL)), "query_transactions").invoke(
         {"date_from": "2026-03-01", "date_to": "2026-01-01"}
     )
     assert isinstance(out, str)
@@ -164,7 +174,7 @@ def test_category_filter_on_uncategorized_data_is_refused():
     模型会自信地报出来，用户没有任何办法察觉。所以宁可拒绝，也不给一个看起来
     正常的错答案。
     """
-    out = tool(build_query_tools(UNCATEGORIZED_BILL), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(UNCATEGORIZED_BILL)), "query_transactions").invoke(
         {"categories": ["咖啡"]}
     )
 
@@ -179,7 +189,7 @@ def test_partially_categorized_data_is_queryable():
         txn(date(2026, 1, 5), "X", "5.00", "咖啡"),
         txn(date(2026, 1, 6), "Y", "9.00"),
     )
-    out = tool(build_query_tools(partly), "query_transactions").invoke(
+    out = tool(build_query_tools(fixed(partly)), "query_transactions").invoke(
         {"categories": ["咖啡"]}
     )
     assert "5.00" in out
@@ -194,7 +204,7 @@ def anomaly_tools():
         txn(date(2026, 3, 14), "TARGET T-1234", "188.40", txn_id="A"),
         txn(date(2026, 3, 14), "TARGET T-1234", "188.40", txn_id="B"),
     )
-    return build_anomaly_tools(bill)
+    return build_anomaly_tools(fixed(bill))
 
 
 def test_all_runs_every_kind(anomaly_tools):
@@ -239,7 +249,7 @@ def test_list_subscriptions_totals_the_year():
     bill = tuple(
         txn(date(2026, m, 5), "NETFLIX.COM", "15.49") for m in range(1, 13)
     )
-    out = tool(build_anomaly_tools(bill), "list_subscriptions").invoke({})
+    out = tool(build_anomaly_tools(fixed(bill)), "list_subscriptions").invoke({})
 
     assert "NETFLIX.COM" in out
     assert "185.88" in out  # 15.49 × 12
@@ -248,5 +258,5 @@ def test_list_subscriptions_totals_the_year():
 
 def test_list_subscriptions_when_there_are_none():
     bill = (txn(date(2026, 1, 5), "ONE OFF", "9.99"),)
-    out = tool(build_anomaly_tools(bill), "list_subscriptions").invoke({})
+    out = tool(build_anomaly_tools(fixed(bill)), "list_subscriptions").invoke({})
     assert "没有" in out

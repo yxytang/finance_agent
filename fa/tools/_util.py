@@ -1,10 +1,20 @@
 """工具层共用的小东西。"""
 
+from collections.abc import Callable
 from functools import lru_cache
 
+from fa.categorize import categorize
 from fa.config import MAX_TOOL_OUTPUT, TRANSACTIONS_CSV
 from fa.ingest import load_transactions
 from fa.models import Money, Transaction
+
+# 工具拿的是**取数函数**，不是数据本身。
+#
+# 一开始传的是元组，看起来更简单，但用户纠正一条分类之后 agent 手里的账单还是
+# 旧的 —— 「纠正了却没变化」比根本不能纠正更让人困惑。传函数就没有这条缝。
+#
+# 顺带，这也正好是第七天接 MCP 的接缝：到时候换掉取数函数就行，工具一行不改。
+Bill = Callable[[], tuple[Transaction, ...]]
 
 
 def truncate(text: str) -> str:
@@ -18,22 +28,6 @@ def truncate(text: str) -> str:
     return text[:MAX_TOOL_OUTPUT] + f"\n…[已截断，原文共 {len(text)} 字符]"
 
 
-@lru_cache(maxsize=1)
-def load_bill() -> tuple[Transaction, ...]:
-    """读账单，**进程内只读一次**。
-
-    每次构造 Session 都会走到这里，而这份 CSV 有 1000 多行 —— 不缓存的话
-    测试里几十次 Session 构造就要重复解析几十遍。文件在进程生命周期里不会变，
-    读一次就够。
-
-    第七天接上 MCP 之后，账单会改从 server 取，这个函数就该退休了。
-
-    返回 tuple 而不是 list：它是共享的缓存对象，**调用方拿到 list 很容易顺手
-    改一改**，然后所有会话都跟着变，而且不报错。
-    """
-    return tuple(load_transactions(TRANSACTIONS_CSV))
-
-
 def format_value(value: Money, agg: str) -> str:
     """按 agg 决定怎么显示这个数。
 
@@ -43,3 +37,28 @@ def format_value(value: Money, agg: str) -> str:
     if agg == "count":
         return f"{int(value):,} 笔"
     return f"{value:,.2f}"
+
+
+@lru_cache(maxsize=1)
+def load_bill() -> tuple[Transaction, ...]:
+    """读账单、贴上类目，进程内只做一次。
+
+    **只走规则和缓存两层，不调 LLM。** 查询是交互式的，不能让用户等一次分类；
+    LLM 那一层由 `python -m data.categorize` 批量跑，跑完写进缓存，这里自动
+    就用上了。
+
+    缓存是必要的：每次构造工具集都会走到这里，而这份 CSV 一千多行。
+    """
+    raw = load_transactions(TRANSACTIONS_CSV)
+    tagged, _ = categorize(raw, use_llm=False)
+    return tuple(tagged)
+
+
+def reload_bill() -> tuple[Transaction, ...]:
+    """清缓存重读。
+
+    用户刚纠正了一条分类时必须调它 —— 否则纠正要等到下次重启才生效，而
+    「纠正了却没变化」比根本不能纠正更让人困惑。
+    """
+    load_bill.cache_clear()
+    return load_bill()

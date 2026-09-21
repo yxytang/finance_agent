@@ -4,32 +4,34 @@
 存不存在。第七天往这里塞 MCP 动态构造出来的工具 —— 到时候 agent.py 一行都不用
 改，这就是这层存在的意义。
 
-`txns` 是给测试用的注入口。不传就读 `data/transactions.csv`（读一次，进程内
-缓存）。第七天账单改从 MCP server 取之后，这个参数会变成「从 server 拉回来
-的那一份」。
+`get_bill` 是**取数函数**不是数据本身（见 `_util.Bill` 的说明）。默认走
+`load_bill`：读 CSV + 贴类目（只走规则和缓存两层，不调 LLM）。
+第七天换成从 MCP server 取，就是换这一个函数的事。
 """
 
 from langchain_core.tools import BaseTool
 
-from fa.models import Transaction
 from fa.permissions import Confirm
-from fa.tools._util import load_bill
+from fa.tools._util import Bill, load_bill
 from fa.tools.anomaly import build_anomaly_tools
+from fa.tools.categorize import build_categorize_tools
+from fa.tools.memory import build_memory_tools
 from fa.tools.query import build_query_tools
 from fa.tools.skills import build_skill_tools
 
 
 def build_tools(
-    confirm: Confirm | None = None, txns: tuple[Transaction, ...] | None = None
+    confirm: Confirm | None = None, get_bill: Bill | None = None
 ) -> list[BaseTool]:
     """构造这个 Session 能用的全部工具。
 
-    `confirm` 现在还没人用（第一个会写数据的工具在第四天）。参数先留着，
-    免得那时候要改所有调用点。
+    `confirm is None` 表示**全部放行**（`python -m fa --yes` 走的就是这条）。
     """
-    bill = load_bill() if txns is None else txns
+    bill = get_bill if get_bill is not None else load_bill
     return [
         *build_query_tools(bill),
         *build_anomaly_tools(bill),
+        *build_categorize_tools(confirm),
+        *build_memory_tools(),
         *build_skill_tools(),
     ]

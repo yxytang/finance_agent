@@ -10,12 +10,15 @@ import sys
 from fa.agent import Session
 from fa.config import (
     CATEGORIES,
+    MEMORY_FILE,
     SKILLS_DIR,
     SKILL_LIST_BUDGET,
     TRANSACTIONS_CSV,
     build_model,
 )
 from fa.events import console_listener
+from fa.memory import forget
+from fa.memory import load as load_memories
 from fa.permissions import make_console_confirm
 from fa.prompt import render_skills_section
 from fa.skills import discover
@@ -40,11 +43,41 @@ HELP = """命令：
   /tools       列出当前可用的工具
   /skills      列出发现到的 skill，并显示清单占多少字节
   /categories  列出固定类目表
+  /memory      查看记住的事；/memory rm N 删掉第 N 条
   /reset       清空对话历史（上下文快满时用）
   /exit        退出
 
 其余输入都会交给 agent 处理。
 """
+
+
+def cmd_memory(arg: str) -> None:
+    """查看和删除跨会话记忆。
+
+    删除做得和查看一样随手，这不是可有可无的功能：**记忆出错的时候用户得能
+    自己修**。一条记错的偏好会一直跟着他，如果只能靠编辑文件或者写脚本才能删，
+    那这条错误就是永久的。
+    """
+    memories = load_memories(MEMORY_FILE)
+
+    if arg.strip():
+        parts = arg.split()
+        if len(parts) == 2 and parts[0] == "rm" and parts[1].isdigit():
+            removed = forget(MEMORY_FILE, int(parts[1]))
+            print(
+                f"  已删除：{removed.text}" if removed else "  没有这个序号。"
+            )
+            return
+        print("  用法：/memory 或 /memory rm N")
+        return
+
+    if not memories:
+        print(f"  （还没有记忆。文件在 {MEMORY_FILE}，直接编辑它也能改。）")
+        return
+
+    for index, memory in enumerate(memories, start=1):
+        print(f"  {index}. [{memory.kind}] {memory.text}")
+    print(f"\n  共 {len(memories)} 条。删第 N 条：/memory rm N")
 
 
 def cmd_tools(session: Session) -> None:
@@ -92,6 +125,9 @@ def handle_command(line: str, session: Session) -> bool:
         cmd_skills()
     elif command == "categories":
         print("  " + "、".join(CATEGORIES))
+    elif command == "memory":
+        _, _, rest = line[1:].partition(" ")
+        cmd_memory(rest)
     elif command == "reset":
         session.reset()
         print("  对话历史已清空。")

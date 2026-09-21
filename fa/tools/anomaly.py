@@ -20,7 +20,7 @@ from fa.anomalies import (
 )
 from fa.config import MAX_ANOMALY_ITEMS
 from fa.models import ZERO, Transaction
-from fa.tools._util import truncate
+from fa.tools._util import Bill, truncate
 
 KINDS = ("all", "duplicates", "price_increase", "outlier")
 
@@ -77,7 +77,7 @@ def _render_outliers(txns, group_by: str) -> list[str]:
     return lines
 
 
-def build_anomaly_tools(txns: tuple[Transaction, ...]) -> list[BaseTool]:
+def build_anomaly_tools(get_bill: Bill) -> list[BaseTool]:
     @tool
     def find_anomalies(kind: str = "all", group_by: str = "merchant") -> str:
         """查账单里可能有问题的地方。用户问「有没有乱扣钱」「账单正常吗」时用它。
@@ -101,6 +101,7 @@ def build_anomaly_tools(txns: tuple[Transaction, ...]) -> list[BaseTool]:
         if kind not in KINDS:
             return f"没有 {kind!r} 这种 kind。可选：{'、'.join(KINDS)}"
 
+        txns = get_bill()
         blocks: list[list[str]] = []
         if kind in ("all", "duplicates"):
             blocks.append(_render_duplicates(txns))
@@ -124,7 +125,7 @@ def build_anomaly_tools(txns: tuple[Transaction, ...]) -> list[BaseTool]:
         金额是**按当前单价折算的未来一年**，不是过去一年实际花了多少（涨过价的
         订阅两者不一样）。要看实际发生额就调 query_transactions 查过去 12 个月。
         """
-        found = find_subscriptions(list(txns))
+        found = find_subscriptions(list(get_bill()))
         if not found:
             return "没有找到固定价格的周期性扣款。"
 

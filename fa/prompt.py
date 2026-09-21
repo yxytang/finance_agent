@@ -100,22 +100,48 @@ def _budget() -> int:
     return config.SKILL_LIST_BUDGET
 
 
-def build_system_prompt(skills) -> str:
+def render_memory_section(memories) -> str:
+    """跨会话记忆 —— 用户教过的事。
+
+    放在 prompt 的**靠后**位置，虽然它讲的是「用户是谁」、按语义该靠前。
+    原因是前缀缓存：记忆会变（用户随时可能说「记住…」），而它一变，它**后面**
+    的所有内容都要重新算。所以顺序按「易变的靠后」排，不按语义排。
+
+    这个取舍有代价 —— 记忆的位置越靠后，它对模型的影响力越弱。但它值得：
+    记忆本来就不该压过人设和数据结构。
+
+    没有记忆时**整段不出现**，不输出「（暂无记忆）」。空段落只会白占 token，
+    而且「暂无记忆」这四个字会让模型以为记忆功能是坏的。
+    """
+    if not memories:
+        return ""
+
+    lines = [f"- {m.text}" for m in memories]
+    return (
+        "## 关于这位用户\n\n"
+        "以下是你以前记住的事。**把它们当作已知事实**，不用再问一遍；"
+        "如果和当前对话里用户说的不一致，**以用户刚说的为准**。\n\n"
+        + "\n".join(lines)
+    )
+
+
+def build_system_prompt(skills, memories=()) -> str:
     """拼出这一轮的 system prompt。
 
-    `skills` 是**显式参数**而不是在这里调 `discover()`：一是不扫盘才叫纯函数，
-    二是指纹门控需要「同样输入必得同样输出」才成立 —— 如果它自己去扫盘，
-    门控依赖的就是一个函数体里看不见的副作用了。
+    `skills` 和 `memories` 都是**显式参数**而不是在这里现读：一是不碰文件才叫
+    纯函数，二是指纹门控需要「同样输入必得同样输出」才成立 —— 如果它自己去
+    读盘，门控依赖的就是一个函数体里看不见的副作用了。
 
-    顺序固定，而且**易变的放最后**：DeepSeek 按精确 token 前缀命中缓存，
-    skill 清单每轮都可能变，放最后就只让它自己那一段失效，前面的人设和数据
+    顺序固定，而且**易变的靠后**：DeepSeek 按精确 token 前缀命中缓存。skill
+    清单和记忆都是会变的，放最后就只让它们自己那一段失效，前面的人设和数据
     说明照样命中。
     """
-    return "\n\n".join(
-        [
-            PERSONA,
-            render_data_section(),
-            STYLE,
-            render_skills_section(skills),
-        ]
-    )
+    sections = [
+        PERSONA,
+        render_data_section(),
+        STYLE,
+        render_memory_section(memories),
+        render_skills_section(skills),
+    ]
+    # 空段落直接丢掉，免得在 prompt 里留下连续空行。
+    return "\n\n".join(section for section in sections if section)

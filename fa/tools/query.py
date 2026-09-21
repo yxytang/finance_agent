@@ -24,7 +24,7 @@ from fa.config import CATEGORIES, MAX_QUERY_GROUPS
 from fa.ingest import IngestError, parse_date
 from fa.models import Transaction, UNCATEGORIZED
 from fa.query import GROUP_LABELS, QueryError, QueryResult, query
-from fa.tools._util import format_value, truncate
+from fa.tools._util import Bill, format_value, truncate
 
 
 def render_result(result: QueryResult) -> str:
@@ -65,15 +65,17 @@ def _parse_optional_date(raw: str, what: str) -> date | None:
         raise QueryError(f"{what}读不出来：{exc}") from exc
 
 
-def build_query_tools(txns: tuple[Transaction, ...]) -> list[BaseTool]:
+def build_query_tools(get_bill: Bill) -> list[BaseTool]:
     @tool
     def describe_data() -> str:
         """看看这份账单覆盖了哪些数据。**拿不准时间范围或类目名时先调它。**
 
-        会告诉你：账单覆盖的起止日期、有多少笔、涉及哪些账户、今天几号。
+        会告诉你：账单覆盖的起止日期、有多少笔、涉及哪些账户、今天几号、
+        有多少笔已经分好类了。
         回答「上个月」「今年」这类相对时间之前**必须**先看一眼 —— 账单的
         截止日期和今天不是一回事，数据通常落后一两个月。
         """
+        txns = get_bill()
         if not txns:
             return "账单是空的。"
 
@@ -132,6 +134,8 @@ def build_query_tools(txns: tuple[Transaction, ...]) -> list[BaseTool]:
 
         金额约定：**支出为正，收入和退款为负**。所以「合计」是净支出。
         """
+        txns = get_bill()
+
         # 一笔都没分类时按类目查，会安静地返回 0 —— 然后模型会自信地告诉用户
         # 「你这个月没吃饭」。**这和「传了一个不存在的类目名」是同一类错误**：
         # 输出看起来完全正常，没有任何东西可以察觉。所以在这里拦下来。
