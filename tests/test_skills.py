@@ -7,6 +7,10 @@ Day 3 会往 skills/ 里放三个财务 skill，这些测试照旧 —— 它们
 不是内容。
 """
 
+import os
+
+import pytest
+
 from fa import config
 from fa.prompt import build_system_prompt, render_skills_section
 from fa.skills import discover, split_frontmatter
@@ -135,13 +139,31 @@ def test_read_resource_refuses_to_escape_the_skill_dir(make_skill, tmp_path):
     assert "秘密" not in out
 
 
-def test_read_resource_refuses_absolute_and_drive_relative_paths(make_skill):
-    """`/etc/passwd` 在 Windows 上 `is_absolute()` 是 False（只有根没有盘符），
-    `C:foo` 也是 False（只有盘符没有根）。两个都得单独拦。"""
+def test_read_resource_refuses_an_absolute_path(make_skill):
+    """`/etc/passwd` 要单独拦一次，不能只靠 resolve 之后的边界判定。
+
+    光靠边界判定也能拦住，但报出来的错会是「跑到目录外面去了」——
+    对用户是答非所问。
+    """
     make_skill("x", "---\nname: x\n---\n")
     (skill,) = discover()
 
     assert "绝对路径" in skill.read_resource("/etc/passwd")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="盘符是 Windows 特有的概念")
+def test_read_resource_refuses_a_drive_relative_path(make_skill):
+    """`C:foo` 这种「有盘符没根」的路径，`is_absolute()` 也是 False。
+
+    **这条只能在 Windows 上跑。** 在 POSIX 上 `C:secret.txt` 就是个普普通通的
+    文件名，`drive` 和 `root` 都是空的，没有半点特殊含义。
+
+    留这条 `skipif` 是因为 CI 第一次跑就红了：本地 Windows 全绿，
+    GitHub Actions（Ubuntu）上必挂 —— 而且挂的原因和被测代码毫无关系。
+    """
+    make_skill("x", "---\nname: x\n---\n")
+    (skill,) = discover()
+
     assert "绝对路径" in skill.read_resource("C:secret.txt")
 
 
