@@ -44,12 +44,38 @@ def render_data_section() -> str:
     """
     listed = "、".join(CATEGORIES)
     return (
-        "## 数据\n\n"
-        "用户的账单在 `data/transactions.csv`，由账单服务提供（用 MCP 的"
-        "工具取，不要自己读文件）。\n\n"
+        "## 账单数据\n\n"
+        "用户的账单通过工具访问，**你不接收也不该试图读取任何文件路径**。\n\n"
         f"**类目是固定这 {len(CATEGORIES)} 个，不要自己发明新的**：\n\n"
         f"{listed}\n\n"
-        "不确定数据的时间跨度、账户有哪些时，先查一次再回答。"
+        "不确定数据的时间跨度、账户有哪些时，先调 `describe_data` 看一眼再回答。"
+    )
+
+
+def render_routing_section() -> str:
+    """两类问题走两条路 —— 这是这个 agent 最容易走错的地方。
+
+    数字问题去查账单，政策问题去查知识库。判断错的表现很隐蔽：**拿账单数据
+    去回答政策问题，会给出一个看起来合理但和问题无关的数字**，而用户很难
+    察觉。所以要把这个岔路口明确写出来。
+
+    两个工具都接不住的问题（「我该不该买房」）也在这里说清楚：诚实的回答是
+    「取决于 A、B、C」，不是硬找一个工具去凑一个答案。
+    """
+    return (
+        "## 两类问题，两条路\n\n"
+        "- **「我花了多少」「有没有被多扣钱」「哪家我去得最多」**\n"
+        "  → 数字问题。答案必须从账单算出来：`query_transactions` /\n"
+        "  `find_anomalies` / `list_subscriptions`。\n\n"
+        "- **「房贷利息能抵多少个税」「应急资金该存几个月」「分期真实利率多少」**\n"
+        "  → 政策/概念问题。答案在知识库里：`search_knowledge`。**这类问题\n"
+        "  不要凭记忆回答**，也不要用账单数据凑。\n\n"
+        "- **两边都不适用的**（「我该不该买房」）→ 诚实说明它取决于哪些因素、\n"
+        "  需要用户提供什么信息，**不要硬凑一个工具**给一个看起来像答案的东西。\n\n"
+        "知识库检索是纯词法的（没有语义向量），**换个说法就搜不到**。所以查的\n"
+        "时候用关键词比用整句准：「专项附加扣除 房贷利息」比「我想知道我这种\n"
+        "情况能少交多少税」命中率高得多。查不到就换个说法再试，两次都不行\n"
+        "就直说没有。"
     )
 
 
@@ -139,6 +165,7 @@ def build_system_prompt(skills, memories=()) -> str:
     sections = [
         PERSONA,
         render_data_section(),
+        render_routing_section(),
         STYLE,
         render_memory_section(memories),
         render_skills_section(skills),

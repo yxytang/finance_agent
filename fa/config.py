@@ -20,6 +20,9 @@ load_dotenv(ENV_FILE)
 DATA_DIR = PROJECT_ROOT / "data"
 SKILLS_DIR = PROJECT_ROOT / "skills"
 KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge"
+# 检索索引的落盘位置。放在 knowledge/.index/ 而不是 data/：它和语料是一体的，
+# 语料换地方了索引也该跟着走。已在 .gitignore 里 —— 它是产物，能重建。
+KNOWLEDGE_INDEX = KNOWLEDGE_DIR / ".index" / "index.json"
 MEMORY_DIR = PROJECT_ROOT / "memory"
 
 TRANSACTIONS_CSV = DATA_DIR / "transactions.csv"

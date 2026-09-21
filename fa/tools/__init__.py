@@ -15,6 +15,7 @@ from fa.permissions import Confirm
 from fa.tools._util import Bill, load_bill
 from fa.tools.anomaly import build_anomaly_tools
 from fa.tools.categorize import build_categorize_tools
+from fa.tools.knowledge import build_knowledge_tools
 from fa.tools.memory import build_memory_tools
 from fa.tools.query import build_query_tools
 from fa.tools.skills import build_skill_tools
@@ -31,6 +32,7 @@ def build_tools(
     return [
         *build_query_tools(bill),
         *build_anomaly_tools(bill),
+        *build_knowledge_tools(),
         *build_categorize_tools(confirm),
         *build_memory_tools(),
         *build_skill_tools(),
