@@ -70,11 +70,15 @@ def test_description_falls_back_to_first_body_line(make_skill):
     assert skill.description == "这是正文第一句。"
 
 
-def test_when_to_use_is_appended(make_skill):
+def test_when_to_use_is_ignored(make_skill):
+    """不认这个字段 —— 和 Claude Code 一致，触发信息只写在 description 里。
+
+    留这条是防回归：`_describe` 一旦又开始拼额外字段，skill 共享到 Claude
+    Code 那边就会少半句，而本地这边不会报任何错。
+    """
     make_skill("x", "---\nname: x\ndescription: 做什么\nwhen_to_use: 何时用\n---\n")
     (skill,) = discover()
-    assert "做什么" in skill.description
-    assert "何时用" in skill.description
+    assert skill.description == "做什么"
 
 
 def test_directories_without_skill_md_are_ignored(make_skill, skills_dir):

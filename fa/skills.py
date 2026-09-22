@@ -150,12 +150,11 @@ def split_frontmatter(text: str) -> tuple[dict, str]:
 def _describe(meta: dict, body: str) -> str:
     """描述。这是**唯一**影响模型选不选这个 skill 的东西。
 
-    `when_to_use` 有就拼在后面：description 说「它是什么」，when_to_use 说
-    「什么时候用它」，而后者才是推动模型做决定的那个。
+    只认 `description`。这里以前还会拼一个自定义的 `when_to_use`，删掉是因为
+    它只对自家的 agent 生效 —— Claude Code 不认识那个字段，skill 一旦共享过去
+    就少了半句，而且不报错。触发信息写在 description 里，没有第二个地方。
     """
-    text = str(meta.get("description") or "").strip() or _first_line(body)
-    when = str(meta.get("when_to_use") or "").strip()
-    return f"{text}（{when}）" if when else text
+    return str(meta.get("description") or "").strip() or _first_line(body)
 
 
 def _first_line(body: str) -> str:
