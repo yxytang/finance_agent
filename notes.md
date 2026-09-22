@@ -1234,6 +1234,40 @@ vertexai 拆成独立包了。
 `tests/test_eval.py` 里有一条测试钉住「每条题都有非空的、够长的参考答案」——
 这类东西坏了不会让任何东西报错，只会让分数悄悄变得没有意义。
 
+## 又一个只在 CI 上炸的问题（这次是依赖，不是路径）
+
+推上去 CI 红了。原因：CI 装的是 `.[dev]`，**不含 `eval` extra**（ragas 会带进
+`datasets` / `pyarrow` / `scipy` 两百多兆），而 `tests/test_eval.py` 通过
+`eval.ragas_run` 间接 import 了 ragas。
+
+改法是把 ragas 的 import 挪进真正用到它的两个函数里。理由不只是「让测试过」：
+**这一天最重要的东西根本不需要 ragas** —— 那道防呆（`sanity_problem`）、题库
+自检、采集器检查，全是纯 Python。依赖的重量不该拖累用不到它的测试。
+
+跳过判断用 `find_spec` 而不是 `pytest.importorskip` —— 后者现在只对
+`ModuleNotFoundError` 跳过，对别的 `ImportError` 直接失败。那是它**有意**的
+设计（区分「没装」和「装了但坏了」），但我不想依赖这个版本相关的细节。
+
+### 顺便：我第一次的「模拟 CI」是错的，而且错得没有声音
+
+想验证「CI 上会怎样」，我建了个假的 `ragas` 模块扔进 `PYTHONPATH`，
+让它 import 时抛错。跑出来两条测试红了 —— 看起来像是我的修复没生效。
+
+实际上那次模拟**什么都没测到**：
+
+- 假模块抛的是普通 `ImportError`，而 `importorskip` / `find_spec` 关心的是
+  模块**能不能被找到**
+- 假的 `ragas` 目录是能被 `find_spec` 找到的，所以 `requires_ragas` 判断为
+  「装了」，测试照跑 —— 然后撞上那个假的抛错
+
+真正的验证是**把 ragas 从 `site-packages` 里挪走**再跑一遍：308 passed
++ 2 skipped。
+
+**教训：模拟环境时，要确认模拟出来的条件和你担心的那个条件真的是同一个。**
+一个搭错了的模拟会给出一个看起来很确定的答案，而那比不模拟更糟 —— 它有
+「我验证过了」的外观。
+
+
 
 
 
