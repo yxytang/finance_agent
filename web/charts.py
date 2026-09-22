@@ -26,12 +26,26 @@ import re
 #   按月份分组（按时间排序）：
 _HEADER = re.compile(r"按(.+?)分组（按(时间|数值)排序）：")
 
+# 预测表头。和上面那个**刻意不同**：多一个「，推算」。
+#
+# 为什么要区分：推算值和观测值长得一模一样，而 chart 载荷里只有一串数字。前端
+# 拿不到「这是猜的」这个信息，就会把推算画得和实测一样 —— 正是这个项目最防的
+# 那种失败：看着合理，但它是错的。
+#
+# 两个正则互斥（`_HEADER` 要求 `排序）：` 紧挨着，这里中间插了「，推算」），
+# 所以不会误判。
+_HEADER_PROJECTED = re.compile(r"按(.+?)分组（按(时间|数值)排序，推算）：")
+
 # 一行分组。渲染格式是 `  {key:<width}  {count:>4} 笔  {value:>14}`。
 #
 # 用「两个以上空格」当分隔符：键（类目名、商户名、月份）里不会有连续两个空格，
 # 而渲染用的填充恰好保证了对齐。取值那部分可能是金额也可能是「308 笔」
 # （agg=count 时），所以宽松地捕获整段再单独解析。
 _ROW = re.compile(r"^ {2}(.+?) {2,}(\d[\d,]*) 笔 {2,}(.+?) *$")
+
+# 预测表的行**没有笔数**。「全月推算」这种事根本数不出笔数来，硬塞一个 1 是编的
+# —— 而这个项目的全部价值就是不要编。所以它单独一个正则，只抓 键 + 值。
+_ROW_PROJECTED = re.compile(r"^ {2}(.+?) {2,}(.+?) *$")
 
 _MONEY = re.compile(r"^-?[\d,]+(\.\d+)?$")
 
@@ -52,15 +66,42 @@ def _number(text: str) -> float | None:
 def extract_series(content: str) -> dict | None:
     """从一段工具结果里抠出分组序列。抠不出来返回 None（不是抛异常）。
 
-    返回 `{"group": "类目", "order": "数值", "rows": [...]}`。
+    返回 `{"group": ..., "order": ..., "kind": ..., "rows": [...]}`，其中
+    `kind` 是 `observed` 或 `projected` —— 前端靠它决定「这张图能不能当成
+    实测数据读」。
 
     **顺序照原样保留**，不重排 —— 渲染时已经按语义排好了（月份按时间升序、
     排行榜按数值降序），重排会把那个语义弄丢。而柱状图的横轴顺序是有意义的。
     """
-    match = _HEADER.search(content)
-    if not match:
-        return None
+    projected = _HEADER_PROJECTED.search(content)
+    if projected:
+        rows = _projected_rows(content)
+        if rows is None or len(rows) < 2:
+            return None
+        return {
+            "group": projected.group(1),
+            "order": projected.group(2),
+            "kind": "projected",
+            "rows": rows,
+        }
 
+    observed = _HEADER.search(content)
+    if observed:
+        rows = _observed_rows(content)
+        if rows is None or len(rows) < 2:
+            return None
+        return {
+            "group": observed.group(1),
+            "order": observed.group(2),
+            "kind": "observed",
+            "rows": rows,
+        }
+
+    return None
+
+
+def _observed_rows(content: str) -> list[dict] | None:
+    """观测表（带笔数）的行。任一行解析不出数就整块放弃。"""
     rows = []
     for line in content.splitlines():
         row = _ROW.match(line)
@@ -74,10 +115,24 @@ def extract_series(content: str) -> dict | None:
             # 因为它看起来是对的。
             return None
 
-        rows.append({"label": label.strip(), "count": int(count.replace(",", "")), "value": value})
+        rows.append(
+            {"label": label.strip(), "count": int(count.replace(",", "")), "value": value}
+        )
+    return rows
 
-    # 一个块都不成组的，不该出图。
-    if len(rows) < 2:
-        return None
 
-    return {"group": match.group(1), "order": match.group(2), "rows": rows}
+def _projected_rows(content: str) -> list[dict] | None:
+    """预测表的行。**count 是 None** —— 预测数不出笔数，前端得容忍这一点。"""
+    rows = []
+    for line in content.splitlines():
+        row = _ROW_PROJECTED.match(line)
+        if not row:
+            continue
+        label, raw_value = row.groups()
+
+        value = _number(raw_value)
+        if value is None:
+            return None
+
+        rows.append({"label": label.strip(), "count": None, "value": value})
+    return rows

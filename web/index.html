@@ -101,6 +101,7 @@
   .tool .out.open { max-height: 26em; overflow-y: auto; }
   .tool.failed .name { color: var(--bad); }
   .tool .chart { margin-top: 8px; max-width: 620px; }
+  .tool .chart-note { font-size: 12px; color: var(--warn); margin-bottom: 5px; }
 
   .note {
     border-radius: 8px; padding: 8px 12px; font-size: 13px; margin: 10px 0;
@@ -409,7 +410,15 @@ function addChart(ev) {
   const card = toolCards[ev.call_id];
   if (!card || typeof Chart === "undefined") return;
 
+  // 预测图**必须一眼看出来是预测**。推算值和实测值长得一模一样，而图里只有一串
+  // 数字 —— 不标的话用户会把推算读成实际发生额。那正是这个项目最防的一类错误：
+  // 没有报错、看着合理、但它是错的。
+  const projected = ev.kind === "projected";
+
   const box = el("div", "chart");
+  if (projected) {
+    box.appendChild(el("div", "chart-note", "预计 —— 这张图含推算值，不是账单里的数"));
+  }
   const canvas = el("canvas");
   box.appendChild(canvas);
   card.appendChild(box);
@@ -419,17 +428,21 @@ function addChart(ev) {
   const rows = ev.rows.slice(0, 10);
   const palette = ["#6aa9ff", "#4ec9a0", "#e0a458", "#e06c75", "#a78bfa",
                    "#38bdf8", "#f472b6", "#facc15", "#34d399", "#fb923c"];
+  // 预测用警示色 + 描边空心柱，和实测的实心柱区分开。
+  const accent = projected ? "#e0a458" : "#6aa9ff";
 
   new Chart(canvas, {
     type: byValue ? "bar" : "line",
     data: {
       labels: rows.map((r) => r.label),
       datasets: [{
-        label: (byValue ? "金额" : "支出") + "（" + ev.group + "）",
+        label: (byValue ? "金额" : "支出") + "（" + ev.group + "）" + (projected ? "·推算" : ""),
         data: rows.map((r) => r.value),
-        backgroundColor: byValue ? rows.map((_, i) => palette[i % palette.length]) : "#6aa9ff33",
-        borderColor: "#6aa9ff",
-        borderWidth: byValue ? 0 : 2,
+        backgroundColor: byValue
+          ? (projected ? accent + "22" : rows.map((_, i) => palette[i % palette.length]))
+          : accent + "33",
+        borderColor: projected ? accent : "#6aa9ff",
+        borderWidth: byValue ? (projected ? 2 : 0) : 2,
         fill: !byValue,
         tension: 0.25,
       }],
@@ -443,7 +456,12 @@ function addChart(ev) {
           callbacks: {
             label: (ctx) => {
               const row = rows[ctx.dataIndex];
-              return `${row.value.toLocaleString()}　(${row.count} 笔)`;
+              const amount = row.value.toLocaleString();
+              // 预测行**没有笔数**（推算数不出笔数），别显示成「undefined 笔」。
+              if (row.count === null || row.count === undefined) {
+                return amount + "　（推算）";
+              }
+              return amount + "　(" + row.count + " 笔)";
             },
           },
         },

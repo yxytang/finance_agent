@@ -97,6 +97,7 @@ class Projection:
     period_start: date
     period_end: date
     observed_through: date
+    today: date
     observed: Money
     count: int
     observed_days: int
@@ -114,8 +115,19 @@ class Projection:
 
     @property
     def is_partial(self) -> bool:
-        """这个区间还没走完 —— 也就是「预测」这件事成立的前提。"""
-        return self.observed_through < self.period_end
+        """区间**还没走完**（相对今天）—— 这是「预测」这件事成立的前提。
+
+        判据是「今天还没到区间末」，**不是**「数据没覆盖到区间末」。后者在月份
+        已经过完、而账单只到 20 号时也成立 —— 那种情况该说的是「账单缺了月末
+        那几天」，不是「这个月还没过完」。两件事混在一起会让一个缺数据的旧月份
+        被当成预测，而它根本不是预测。
+        """
+        return self.period_end >= self.today
+
+    @property
+    def is_complete(self) -> bool:
+        """数据覆盖到了区间末 —— 也就是说实际值可以直接报，不用推。"""
+        return self.observed_through >= self.period_end
 
 
 @dataclass(frozen=True)
@@ -250,6 +262,7 @@ def project_period(
         period_start=period_start,
         period_end=period_end,
         observed_through=observed_through,
+        today=today,
         observed=observed,
         count=len(window),
         observed_days=observed_days,

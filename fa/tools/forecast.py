@@ -30,30 +30,65 @@ from fa.tools._util import Bill, truncate
 
 
 def _render_projection(p) -> str:
-    """把一个 Projection 渲染出来。**依据和推断值必须挨着。**"""
+    """把一个 Projection 渲染出来。**依据和推断值必须挨着。**
+
+    三种情况分开走，因为它们的**诚实说法不同**：
+
+      · 数据覆盖到区间末 → 这是实测。给它标「预计」等于把准确的说成猜的，
+        用户会去核对一个本来不用核对的东西。
+      · 区间还在走 → 预测，下半段那张表给图用。
+      · 区间已过完但账单缺天 → 缺的是**过去**，不是未来。推出来的数是在补一段
+        已经发生、只是没记上的日子；说成「预测」会让人以为在往前看。
+
+    下半段那张表是给图用的（`web/charts.py` 认「，推算」这个标记），格式不能
+    随手改 —— 一改图表就**静默消失**，控制台干净、没有报错。改这里要同步看
+    `tests/test_web.py` 里那条闭环测试，它会红。
+    """
+    if p.is_complete:
+        return (
+            f"{p.period_start.isoformat()} ~ {p.period_end.isoformat()} 的数据是完整的。\n"
+            "\n"
+            f"  实际合计  {p.observed:,.2f}   （{p.count} 笔，{p.total_days} 天）\n"
+            "\n"
+            "不用推算，报这个数就行。"
+        )
+
     if not p.is_partial:
+        missing = (p.period_end - p.observed_through).days
         return (
             f"{p.period_start.isoformat()} ~ {p.period_end.isoformat()} 已经过完了，"
-            f"不用推算：\n\n"
-            f"  实际合计  {p.observed:,.2f}   （{p.count} 笔，{p.total_days} 天）\n\n"
-            "这段时间的数据是完整的，报这个数就行。"
+            f"但**账单只到 {p.observed_through.isoformat()}**，缺最后 {missing} 天。\n"
+            "\n"
+            f"  已发生（不完整）  {p.observed:,.2f}   "
+            f"（{p.count} 笔，{p.observed_days} / {p.total_days} 天）\n"
+            "\n"
+            "这**不是预测**，是一条数据缺口 —— 缺的那几天已经发生了，只是账单里没有。"
+            "要补齐就重新生成账单（`python -m data.generate`）。\n"
+            f"**别把 {p.observed:,.2f} 当成整月的实际值报出去**，它偏小。"
         )
+
+    observed_label = f"已发生到 {p.observed_through.strftime('%m-%d')}"
+    projected_label = f"全月推算（{p.total_days} 天）"
+    width = max(len(observed_label), len(projected_label)) + 2
 
     return (
         f"{p.period_start.isoformat()} ~ {p.period_end.isoformat()}"
         f"（全月 {p.total_days} 天）**还没过完**，账单只到 {p.observed_through.isoformat()}。\n"
         "\n"
-        f"  已发生    {p.observed:>12,.2f}   "
-        f"（{p.period_start.isoformat()} ~ {p.observed_through.isoformat()}，"
-        f"{p.observed_days} 天，{p.count} 笔）\n"
-        f"  日均      {p.daily_rate:>12,.2f}\n"
-        f"  全月推算  {p.projected:>12,.2f}\n"
+        "按时间范围分组（按数值排序，推算）：\n"
         "\n"
-        f"**{p.projected:,.2f} 是推算值，不是账单里的数。** 依据只有一条：已发生的 "
-        f"{p.observed:,.2f} ÷ {p.observed_days} 天 = {p.daily_rate:,.2f}/天，再乘 "
-        f"{p.total_days} 天。月末如果集中出现大额支出（或者没有），实际会和它不一样。\n"
+        f"  {observed_label:<{width}}{p.observed:>13,.2f}\n"
+        f"  {projected_label:<{width}}{p.projected:>13,.2f}\n"
         "\n"
-        "回答时请把**已发生的数和推算的数分开说**，别让推算看起来像实际发生额。"
+        f"推算依据：已发生的那格是 {p.period_start.isoformat()} ~ "
+        f"{p.observed_through.isoformat()}（{p.observed_days} 天，{p.count} 笔），"
+        f"日均 {p.daily_rate:,.2f}。\n"
+        f"**{p.projected:,.2f} = {p.observed:,.2f} ÷ {p.observed_days} 天 × "
+        f"{p.total_days} 天**，假设是日均不变。月末如果集中出现大额支出（或者没有），"
+        "实际会和它不一样。\n"
+        "\n"
+        f"回答时请把**已发生的数和推算的数分开说** —— {p.projected:,.2f} 是推算值，"
+        "不是账单里的数，别让它看起来像实际发生额。"
     )
 
 

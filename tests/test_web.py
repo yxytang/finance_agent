@@ -14,6 +14,7 @@ import pytest
 
 from fa.models import Transaction, money
 from fa.query import query
+from fa.tools.forecast import build_forecast_tools
 from fa.tools.query import render_result
 from web.charts import extract_series
 from web.sessions import (
@@ -72,6 +73,90 @@ def test_chart_parser_matches_the_real_renderer():
     assert [r["label"] for r in series["rows"]] == ["超市", "咖啡"]
     assert [r["value"] for r in series["rows"]] == [550.0, 75.0]
     assert [r["count"] for r in series["rows"]] == [2, 2]
+
+
+def test_observed_series_are_marked_observed():
+    """观测序列要带上 kind。
+
+    没有这个字段的话前端只能默认「是实测」，而预测图会悄悄混进来 —— 然后一张
+    「这个月大概会花多少」的推算图，看起来就和实测的一模一样。
+    """
+    series = extract_series(render_result(query(bill(), group_by="category")))
+
+    assert series["kind"] == "observed"
+
+
+def test_chart_parser_reads_a_projection_as_projected():
+    """预测表的闭环 —— 和上面那条同一个道理。
+
+    预测的渲染格式一改，图表要么**静默消失**、要么**被当成实测数据**，两种都
+    不报错。所以必须拿**真实的预测工具**跑一遍再解回来。
+
+    预测行**没有笔数**：推算数不出笔数来，解析出来的 count 必须是 None，
+    而不是随手填一个数 —— 填了就是在编。
+    """
+    partial = [
+        Transaction(date(2026, 9, 1), "超市", money("100.00"), "credit", "T1", "超市"),
+        Transaction(date(2026, 9, 10), "超市", money("100.00"), "credit", "T2", "超市"),
+    ]
+    tools = build_forecast_tools(lambda: partial, lambda: date(2026, 9, 11))
+    tool = next(t for t in tools if t.name == "project_spending")
+
+    rendered = tool.invoke({"month": "2026-09"})
+
+    series = extract_series(rendered)
+
+    assert series is not None
+    assert series["kind"] == "projected"
+    assert [r["label"] for r in series["rows"]] == ["已发生到 09-10", "全月推算（30 天）"]
+    assert [r["value"] for r in series["rows"]] == [200.0, 600.0]  # 200 / 10 × 30
+    assert [r["count"] for r in series["rows"]] == [None, None]
+
+
+def test_a_projected_block_is_not_mistaken_for_an_observed_one():
+    """两个表头必须互斥 —— 认错的话推算就会被画成实测。"""
+    projected = "按时间范围分组（按数值排序，推算）：\n\n  甲  1.00\n  乙  2.00\n"
+
+    series = extract_series(projected)
+
+    assert series["kind"] == "projected"
+
+
+def test_a_finished_month_is_not_a_projection():
+    """月份已经过完、但账单缺了月末几天时，**不能**说成是预测。
+
+    缺的是**过去**（那几天已经发生了，只是没记上），不是未来。说成「预计」会让
+    用户以为在往前看，然后拿一个偏小的数当整月实际值。
+    """
+    gap = [
+        Transaction(date(2026, 8, 1), "超市", money("100.00"), "credit", "T1", "超市"),
+        Transaction(date(2026, 8, 20), "超市", money("100.00"), "credit", "T2", "超市"),
+    ]
+    tools = build_forecast_tools(lambda: gap, lambda: date(2026, 9, 11))
+    tool = next(t for t in tools if t.name == "project_spending")
+
+    rendered = tool.invoke({"month": "2026-08"})
+
+    assert "已经过完了" in rendered
+    assert "数据缺口" in rendered
+    # 不出预测图 —— 这张图不是预测。
+    assert extract_series(rendered) is None
+
+
+def test_a_complete_month_reports_the_actual():
+    """数据覆盖到月末时直接报实际值，标「预计」等于把准确的说成猜的。"""
+    done = [
+        Transaction(date(2026, 8, 1), "超市", money("100.00"), "credit", "T1", "超市"),
+        Transaction(date(2026, 8, 31), "超市", money("200.00"), "credit", "T2", "超市"),
+    ]
+    tools = build_forecast_tools(lambda: done, lambda: date(2026, 9, 11))
+    tool = next(t for t in tools if t.name == "project_spending")
+
+    rendered = tool.invoke({"month": "2026-08"})
+
+    assert "数据是完整的" in rendered
+    assert "300.00" in rendered
+    assert extract_series(rendered) is None
 
 
 def test_chart_parser_handles_month_grouping():
