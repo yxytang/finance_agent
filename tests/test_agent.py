@@ -17,6 +17,7 @@ from fa.events import (
     ANSWER,
     ERROR,
     STEP_START,
+    STOPPED,
     TOOL_CALL,
     TOOL_RESULT,
     console_listener,
@@ -294,3 +295,97 @@ def test_console_listener_renders_tool_calls(capsys):
     assert "← query_transactions" in out
     assert "合计 1,234.56" in out  # 只取第一行
     assert "上个月外卖 1,234.56" in out
+
+
+# --- 打断一轮 -----------------------------------------------------------
+
+
+def test_stopping_mid_tool_calls_still_answers_every_call():
+    """停指令到达时，**每条 tool_call 仍然要有一条 ToolMessage**。
+
+    这是全文件最要紧的不变量（见 `_run_tool_calls` 的说明）：少一条，下一轮
+    invoke 就会被 API 直接拒绝 —— 而用户停完马上就会接着问下一句。
+
+    所以停止**不能**从工具循环里直接抛出去，必须先把剩下的结果补齐。
+    """
+    s = session()
+    ran: list[dict] = []
+
+    def stop_then_run(args):
+        s.stop()  # 第一条工具一跑就按停
+        ran.append(args)
+        return "结果"
+
+    s.tool_map["lookup"] = SimpleNamespace(invoke=stop_then_run)
+    s._model = _ScriptedModel(
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "lookup", "args": {"q": "1"}, "id": "c1"},
+                {"name": "lookup", "args": {"q": "2"}, "id": "c2"},
+            ],
+        ),
+    )
+
+    answer = s.send("跑两个")
+
+    assert ran == [{"q": "1"}]  # 第二条没执行
+    answered = [m for m in s.messages if isinstance(m, ToolMessage)]
+    assert [m.tool_call_id for m in answered] == ["c1", "c2"]  # 但两条都有应答
+    assert "已停止" in answered[1].content
+    assert "已停止" in answer
+
+
+def test_stop_after_the_last_tool_call_still_stops():
+    """信号在**最后一个**工具执行期间到达时，靠的是步与步之间那次检查。
+
+    每个工具调用之前查一次还不够 —— 最后一次执行期间到达的信号，那时候已经没有
+    「下一个工具」可以查了。没有那一步之间的检查，就会白跑一次模型调用。
+    """
+    s = session()
+    s.tool_map["lookup"] = SimpleNamespace(invoke=lambda args: (s.stop(), "结果")[1])
+    model = _ScriptedModel(
+        AIMessage(content="", tool_calls=[{"name": "lookup", "args": {}, "id": "c1"}]),
+        AIMessage(content="不该被调到"),
+    )
+    s._model = model
+
+    answer = s.send("跑一个")
+
+    assert "已停止" in answer
+    assert len(model.replies) == 1  # 第二次模型调用没有发生
+
+
+def test_a_stale_stop_does_not_kill_the_next_turn():
+    """停完接着问是正常操作 —— 上一轮留下的信号必须被清掉。
+
+    不清的话新一轮会在第一步就被立刻停掉，而那个表现看起来像「它坏了」。
+    """
+    s = session()
+    s._model = _ScriptedModel(AIMessage(content="正常回答"))
+    s.stop()
+
+    assert s.send("接着问") == "正常回答"
+
+
+def test_stop_emits_stopped_not_error_and_not_answer():
+    """停止是第三种语义 —— 既不是故障也不是模型的回答。
+
+    混进 error，用户会以为坏了；混进 answer，用户会把那句「已停止」当成 agent
+    的观点。
+    """
+    events: list[dict] = []
+    s = session(on_event=events.append)
+    s.tool_map["lookup"] = SimpleNamespace(invoke=lambda args: (s.stop(), "结果")[1])
+    s._model = _ScriptedModel(
+        AIMessage(content="", tool_calls=[{"name": "lookup", "args": {}, "id": "c1"}]),
+        AIMessage(content="不该被调到"),
+    )
+
+    s.send("跑一个")
+
+    kinds = [e["type"] for e in events]
+    assert STOPPED in kinds
+    assert ERROR not in kinds
+    assert ANSWER not in kinds
+    assert "已停止" in next(e for e in events if e["type"] == STOPPED)["text"]

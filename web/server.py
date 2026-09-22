@@ -200,6 +200,24 @@ def confirm(session_id: str, verdict: Verdict, request: Request) -> dict:
     return {"accepted": True}
 
 
+@app.post("/api/sessions/{session_id}/stop")
+def stop_turn(session_id: str, request: Request) -> dict:
+    """请求打断正在跑的那一轮。
+
+    **不会立刻停。** agent 那边会在当前这一步跑完之后才停（模型调用拦不住），
+    所以返回的是 `stopping` 而不是「已停止」—— 界面该显示「正在停」，否则用户
+    会以为已经停了，而实际上还有一次模型往返在跑。
+    """
+    _check(request)
+    live = manager.get(session_id)
+    if live is None:
+        raise HTTPException(status_code=404, detail="没有这个会话")
+
+    if not live.stop():
+        return {"accepted": False, "reason": "这一轮已经跑完了"}
+    return {"accepted": True, "stopping": True}
+
+
 @app.post("/api/sessions/{session_id}/chart")
 def chart(session_id: str, payload: dict) -> dict:
     """把一段工具结果转成图表数据。

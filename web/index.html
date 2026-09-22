@@ -117,6 +117,13 @@
   .note.bad { background: #2c2224; color: var(--bad); border-color: #46302f; }
   .note.dim { background: #22262c; color: var(--dim); border-color: var(--line); }
 
+  /* 「已停止」既不是错误也不是模型的回答 —— 单独一档，否则用户会把
+     「你让我停的」读成「出问题了」。 */
+  .msg.stopped {
+    background: #2a2529; color: var(--warn); border: 1px solid #3d3438;
+    border-radius: 10px; padding: 9px 13px; font-size: 14px; white-space: pre-wrap;
+  }
+
   footer { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 16px; }
   .composer { max-width: 820px; margin: 0 auto; display: flex; gap: 9px; }
   textarea {
@@ -172,6 +179,7 @@
   <footer>
     <div class="composer">
       <textarea id="input" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="stop" hidden>停止</button>
       <button id="send" class="primary" style="background:#2d4a6b;border-color:#3c5f85">发送</button>
     </div>
     <div class="hint">工具调用会实时显示 —— 这样你能看出它有没有走偏，而不是干等一个数字。</div>
@@ -218,6 +226,11 @@ function setBusy(value) {
   busy = value;
   $("send").disabled = value;
   $("input").disabled = value;
+  // 停止按钮只在跑着的时候出现。顺手把文案复位 —— 上一次点完之后它停在
+  // 「正在停…」上，不复位的话下一轮一开跑就显示成正在停。
+  $("stop").hidden = !value;
+  $("stop").disabled = false;
+  $("stop").textContent = "停止";
   if (!value) $("input").focus();
 }
 
@@ -386,6 +399,12 @@ function render(ev) {
       if (current) current.innerHTML = markdown(ev.text);
       break;
 
+    case "stopped":
+      // 单独一档样式 —— 它不是错误（流程好着呢），也不是模型的回答（那句话
+      // 没说完）。混进任何一边都会被读错。
+      bubble("stopped", ev.text);
+      break;
+
     case "error":
       (current || bubble("answer")).appendChild(el("div", "note bad", ev.message));
       break;
@@ -548,6 +567,21 @@ async function send() {
 $("send").onclick = send;
 $("input").onkeydown = (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+};
+$("stop").onclick = async () => {
+  // 文案是「正在停」不是「已停」：agent 那边会在**当前这一步跑完之后**才停
+  //（模型调用拦不住），说成「已停止」会让用户以为现在就能接着问。
+  $("stop").disabled = true;
+  $("stop").textContent = "正在停…";
+  try {
+    const res = await api(`/api/sessions/${sessionId}/stop`, {});
+    if (!res.accepted) setBusy(false);   // 这一轮已经跑完了，按钮收起来
+  } catch (err) {
+    $("stop").disabled = false;
+    $("stop").textContent = "停止";
+    (current || bubble("answer"))
+      .appendChild(el("div", "note bad", "停不了：" + err.message));
+  }
 };
 $("new").onclick = newSession;
 

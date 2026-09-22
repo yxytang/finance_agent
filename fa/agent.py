@@ -15,15 +15,24 @@ print，就等于把「浏览器里什么都不显示」这个 bug 焊死在循�
 """
 
 import sys
+import threading
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from fa.config import MAX_STEPS, build_model
-from fa.events import ANSWER, ERROR, STEP_START, TOOL_CALL, TOOL_RESULT
+from fa.events import ANSWER, ERROR, STEP_START, STOPPED, TOOL_CALL, TOOL_RESULT
 from fa.memory import load as load_memories
 from fa.prompt import build_system_prompt
 from fa.skills import discover
 from fa.tools import build_tools
+
+
+class TurnStopped(Exception):
+    """用户主动打断了一轮。
+
+    **不是错误。** 调用方要能把它和崩溃分开 —— 一个该显示「已停止」，另一个
+    该显示「出错了」。
+    """
 
 _CONTEXT_OVERFLOW_MARKERS = (
     "context length",
@@ -105,6 +114,10 @@ class Session:
         self._fixed_prompt = system_prompt
         self._max_steps = max_steps or MAX_STEPS
 
+        # 打断信号。用 Event 而不是布尔量，是因为它会被**另一个线程**设置 ——
+        # Web 那边 agent 跑在工作线程里，而停止请求从 HTTP 线程进来。
+        self._stop = threading.Event()
+
         self.tools = build_tools(confirm) if tools is None else list(tools)
         self.tool_map = {t.name: t for t in self.tools}
 
@@ -138,6 +151,18 @@ class Session:
     def _fail(self, message: str) -> str:
         """播报一条错误事件，并把同一段文本当作本轮答复返回。"""
         self._emit({"type": ERROR, "message": message})
+        return message
+
+    def _stopped(self) -> str:
+        """播报「被叫停」，并把同一段文本当答复返回。
+
+        形状和 `_fail` 一样，但**事件类型不同** —— 这不是故障，流程好着呢。
+        """
+        message = (
+            "已停止 —— 这一轮按你的要求中断了。\n"
+            "已经跑过的工具调用留在对话里（它们确实发生过），可以直接接着问。"
+        )
+        self._emit({"type": STOPPED, "text": message})
         return message
 
     # ------------------------------------------------------------------
@@ -203,15 +228,23 @@ class Session:
 
         for call in ai_message.tool_calls:
             ok = True
-            try:
-                content = self._execute(call)
-            except KeyboardInterrupt as exc:
-                interrupted = exc
+            if self._stop.is_set():
+                # 停指令到了：**剩下的工具不再执行**，但每一条仍然要补一个
+                # ToolMessage。少一条，下一轮 invoke 就会被 API 拒绝 —— 而
+                # 「停下来」之后用户马上会接着问下一句。
+                interrupted = interrupted or TurnStopped()
                 ok = False
-                content = "已中断：用户取消了这次工具调用。"
-            except Exception as exc:  # noqa: BLE001 - 全部转成可读的观察结果
-                ok = False
-                content = f"工具执行失败：{type(exc).__name__}: {exc}"
+                content = "已停止：这一轮被中断，该工具没有执行。"
+            else:
+                try:
+                    content = self._execute(call)
+                except KeyboardInterrupt as exc:
+                    interrupted = exc
+                    ok = False
+                    content = "已中断：用户取消了这次工具调用。"
+                except Exception as exc:  # noqa: BLE001 - 全部转成可读的观察结果
+                    ok = False
+                    content = f"工具执行失败：{type(exc).__name__}: {exc}"
 
             self.messages.append(ToolMessage(content=content, tool_call_id=call["id"]))
             self._emit(
@@ -245,11 +278,18 @@ class Session:
         """
         self.refresh_system_prompt()
 
+        # 上一轮留下的停止信号不该影响这一轮 —— 停完接着问是正常操作，不清的话
+        # 新一轮会在第一步就立刻被停掉。
+        self._stop.clear()
+
         # 记下检查点：上下文超限时回滚到这里，让会话仍然可用。
         checkpoint = len(self.messages)
         self.messages.append(HumanMessage(text))
 
         for step in range(1, self._max_steps + 1):
+            if self._stop.is_set():
+                return self._stopped()
+
             self._emit({"type": STEP_START, "step": step})
 
             try:
@@ -290,7 +330,10 @@ class Session:
                     }
                 )
 
-            self._run_tool_calls(ai_message)
+            try:
+                self._run_tool_calls(ai_message)
+            except TurnStopped:
+                return self._stopped()
 
         # 步数用完。此刻每条 tool_call 都已经有应答，历史是合法的 ——
         # 不需要（也不该）伪造一条 assistant 消息，直接告诉用户就行。
@@ -302,3 +345,15 @@ class Session:
     def reset(self) -> None:
         self.messages.clear()
         self._prompt_fingerprint = None
+
+    def stop(self) -> None:
+        """请求打断当前这一轮。
+
+        **不保证立刻停下。** 模型调用是阻塞的，没法中断，所以这一轮会在**当前
+        这一步跑完之后**才停 —— 一步 = 一次模型调用 + 它要的工具调用，最坏情况
+        下用户还要再等一次模型往返。这是这个方法能做到的上限，界面上别把它说成
+        「立即停止」。
+
+        再调 `send()` 会自动清掉这个信号，所以停完不用手动复位。
+        """
+        self._stop.set()

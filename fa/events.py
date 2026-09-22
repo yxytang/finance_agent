@@ -30,6 +30,10 @@ TOOL_CALL = "tool_call"
 TOOL_RESULT = "tool_result"
 ANSWER = "answer"
 ERROR = "error"
+# 用户主动打断了一轮。**和 `error` 分开，和 `answer` 也分开**：它不是故障（流程
+# 好着呢），也不是模型的观点（模型那句话没说完）。混进任何一边，用户都会把
+# 「你让我停的」读成「出问题了」或者「它就是这么答的」。
+STOPPED = "stopped"
 
 
 def console_listener() -> Listener:
@@ -53,6 +57,10 @@ def console_listener() -> Listener:
             first = content.splitlines()[0][:160] if content else "(空)"
             print(f"  ← {event['name']}({event['args']})\n    {first}")
         elif kind == ANSWER:
+            print(f"\n{event['text']}\n")
+        elif kind == STOPPED:
+            # 终端里和 `answer` 一样渲染就行 —— 文本自己说了「已停止」。分开的是
+            # **事件类型**，浏览器那边要靠它换个样式。
             print(f"\n{event['text']}\n")
         elif kind == ERROR:
             print(f"\n{event['message']}\n")

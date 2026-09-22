@@ -516,6 +516,23 @@ def test_manager_list_includes_everything_it_created():
     assert {item.id for item in manager.list()} == created
 
 
+def test_stopping_an_idle_session_reports_nothing_running():
+    """空闲时如实说「没在跑」，而不是假装接受了 —— 界面靠这个决定要不要收按钮。"""
+    live = LiveSession("t", confirm=False)
+
+    assert live.stop() is False
+
+
+def test_stopping_a_busy_session_reaches_the_agent():
+    """`LiveSession.stop()` 只是**转发** —— 只有 agent 那边知道怎么安全地停
+    （模型调用拦不住，所以要停在当前这一步之后）。"""
+    live = LiveSession("t", confirm=False)
+    live.busy = True
+
+    assert live.stop() is True
+    assert live.session._stop.is_set()
+
+
 # --- 前端渲染 -----------------------------------------------------------
 #
 # 前端在此之前完全没有测试。这条是第一个，它有具体的由来：`markdown()` 里刚发现

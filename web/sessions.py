@@ -221,6 +221,22 @@ class LiveSession:
         pending.set()
         return True
 
+    def stop(self) -> bool:
+        """请求停掉正在跑的那一轮。返回「当时确实有一轮在跑」。
+
+        只是**转发**给 agent 的 `Session.stop()` —— 只有那里知道怎么安全地停
+        （见它的说明：模型调用拦不住，所以会停在当前这一步之后）。
+
+        判 `busy` 和转发之间有缝：这一轮可能正好在这中间跑完。后果是往一个已经
+        空闲的会话上设了停止信号，而下一次 `send()` 开头会清掉它 —— 无害，
+        不值得为它加锁把两个线程串起来。
+        """
+        with self.lock:
+            if not self.busy:
+                return False
+        self.session.stop()
+        return True
+
     # --- 跑一轮 ---------------------------------------------------------
 
     def run(self, text: str) -> None:
