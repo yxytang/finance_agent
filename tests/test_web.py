@@ -6,9 +6,13 @@
 
 import json
 import queue
+import re
+import shutil
+import subprocess
 import threading
 import time
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -510,3 +514,73 @@ def test_manager_list_includes_everything_it_created():
     created = {manager.create().id for _ in range(3)}
 
     assert {item.id for item in manager.list()} == created
+
+
+# --- 前端渲染 -----------------------------------------------------------
+#
+# 前端在此之前完全没有测试。这条是第一个，它有具体的由来：`markdown()` 里刚发现
+# 一个**不报错**的 bug —— 转义在匹配**之前**做，所以 `>` 已经是 `&gt;` 了，而
+# 引用的正则还在匹配 `>`，永远匹配不上。表现是引用静默地退化成普通段落。
+#
+# 那种 bug 只有把函数真的跑起来才看得见，所以这里用 node 跑 —— 那段逻辑就是 JS。
+# **没有 node 就跳过**（CI 上只装 Python，这条在那边不参与）。
+
+_INDEX = Path(__file__).resolve().parent.parent / "web" / "index.html"
+
+
+def _markdown_source() -> str:
+    """从 index.html 里抠出 `markdown()` 的源码。"""
+    html = _INDEX.read_text(encoding="utf-8")
+    js = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)[-1]
+    return js[js.index("function markdown(text)"): js.index("// 不是 newSession")]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="没有 node，跑不了前端脚本")
+def test_markdown_renders_lists_quotes_and_links():
+    cases = [
+        ["- 甲\n- 乙", "<ul>\n<li>甲</li>\n<li>乙</li>\n</ul>"],
+        ["1. 甲\n2. 乙", "<ol>\n<li>甲</li>\n<li>乙</li>\n</ol>"],
+        # 引用：标记里的 `>` 在匹配时已经是 `&gt;` 了 —— 这条就是那个 bug 的守卫
+        ["> 一\n> 二", "<blockquote>\n<div>一</div>\n<div>二</div>\n</blockquote>"],
+        ["**粗**和*斜*", "<div><strong>粗</strong>和<em>斜</em></div>"],
+        # 表格不能被列表规则吃掉（`|---|---|` 里没有 `- `，但顺序变了就会出事）
+        [
+            "| a | b |\n|---|---|\n| 1 | 2 |",
+            "<table>\n<tr><td>a</td><td>b</td></tr>\n<tr><td>1</td><td>2</td></tr>\n</table>",
+        ],
+    ]
+    checks = """
+const cases = %s;
+for (const [input, want] of cases) {
+  const got = markdown(input);
+  if (got !== want) {
+    console.error('want ' + JSON.stringify(want) + '\\n got ' + JSON.stringify(got));
+    process.exit(1);
+  }
+}
+
+// 只放行 http/https。`javascript:` 不许生成 <a> —— 这段输出会直接进 DOM。
+if (markdown('[坏](javascript:alert(1))').includes('<a')) {
+  console.error('javascript: 生成了 <a>'); process.exit(1);
+}
+
+// href 是拼进属性的，引号不转义就能从属性里跑出去。
+if (markdown('[x](https://a.com/\\"onmouseover=\\"alert(1))').includes('onmouseover=\\"alert')) {
+  console.error('href 里的引号没转义'); process.exit(1);
+}
+
+// 代码块里的内容不参与渲染。
+const code = markdown('```\\n- 不是列表\\n> 不是引用\\n```');
+if (code.includes('<ul>') || code.includes('<blockquote>')) {
+  console.error('代码块被渲染了'); process.exit(1);
+}
+""" % json.dumps(cases, ensure_ascii=False)
+
+    result = subprocess.run(
+        ["node", "-e", _markdown_source() + checks],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0, result.stderr

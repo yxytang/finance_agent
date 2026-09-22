@@ -85,6 +85,13 @@
   .msg.answer code { background: #232833; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
   .msg.answer pre { background: #232833; padding: 10px; border-radius: 6px; overflow-x: auto; }
   .msg.answer pre code { background: none; padding: 0; }
+  .msg.answer ul, .msg.answer ol { margin: 8px 0; padding-left: 22px; }
+  .msg.answer li { margin: 3px 0; }
+  .msg.answer blockquote {
+    margin: 8px 0; padding: 2px 0 2px 12px;
+    border-left: 3px solid var(--line); color: var(--dim);
+  }
+  .msg.answer a { color: var(--accent); }
 
   .tool {
     border-left: 2px solid var(--line); margin: 7px 0 7px 4px; padding: 3px 0 3px 12px;
@@ -128,6 +135,20 @@
   dialog .row { display: flex; gap: 9px; justify-content: flex-end; }
   dialog button.primary { background: #2d4a6b; border-color: #3c5f85; }
   .hint { color: var(--dim); font-size: 12px; max-width: 820px; margin: 7px auto 0; }
+
+  /* 窄屏：侧栏从左边挪到上面。212px 的固定宽度在手机上会把对话挤成一条细缝，
+     而对话才是这个界面的主体。 */
+  @media (max-width: 720px) {
+    body { flex-direction: column; }
+    #sidebar {
+      width: 100%; max-height: 26vh;
+      border-right: none; border-bottom: 1px solid var(--line);
+    }
+    header { padding: 8px 12px; }
+    main { padding: 12px 10px 6px; }
+    footer { padding: 10px 12px; }
+    .msg.user { max-width: 92%; }
+  }
 </style>
 </head>
 <body>
@@ -511,7 +532,15 @@ async function send() {
     await api(`/api/sessions/${sessionId}/messages`, { text });
   } catch (err) {
     setBusy(false);
-    (current || bubble("answer")).appendChild(el("div", "note bad", "发不出去：" + err.message));
+    // **把内容还回输入框。** 清空是在发请求之前做的，失败时不还回去，用户刚打的
+    // 那段就没了 —— 而重试的成本是把它们重新打一遍。放回去之后按一下回车就是重试。
+    //
+    // 刻意**不做自动重试**：这个 POST 会真的启动一轮 agent（真金白银的 LLM 调用），
+    // 而失败时我们不知道对面收到没有 —— 自动重发有可能把一轮变成两轮。
+    $("input").value = text;
+    (current || bubble("answer")).appendChild(
+      el("div", "note bad", "发不出去：" + err.message + "　（内容已放回输入框，回车重试）")
+    );
     scroll();
   }
 }
@@ -527,18 +556,49 @@ $("new").onclick = newSession;
 // 只处理模型实际会用的那几种：表格、标题、加粗、行内代码、代码块。
 // 引一个 markdown 库也可以，但那样这个文件就不是「一眼能读完」的了。
 function markdown(text) {
-  const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  // 引号也要转义 —— 链接的 href 是拼进属性里的，不转的话
+  // `[x](http://a/"onmouseover="alert(1))` 能从这个属性里跑出去。
+  const esc = (s) => s.replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
   const lines = esc(text).split("\n");
   const out = [];
   let inTable = false, inCode = false;
+  // 连续的同类型块要合成一个 —— `- a` 紧跟 `- b` 是一个两元素列表，不是两个
+  // 单元素列表（后者渲染出来每个之间都有间距）。
+  let block = null;   // null | "ul" | "ol" | "blockquote"
+
+  const closeBlock = () => { if (block) { out.push(`</${block}>`); block = null; } };
+  const openBlock = (kind) => { if (block !== kind) { closeBlock(); out.push(`<${kind}>`); block = kind; } };
 
   for (const raw of lines) {
     if (raw.trim().startsWith("```")) {
+      closeBlock();
       out.push(inCode ? "</code></pre>" : "<pre><code>");
       inCode = !inCode;
       continue;
     }
     if (inCode) { out.push(raw); continue; }
+
+    const bullet = raw.match(/^\s*[-*]\s+(.*)$/);
+    const numbered = raw.match(/^\s*\d+\.\s+(.*)$/);
+    if (bullet || numbered) {
+      openBlock(bullet ? "ul" : "ol");
+      out.push(`<li>${(bullet || numbered)[1]}</li>`);
+      continue;
+    }
+
+    // 注意匹配的是 **`&gt;`** 而不是 `>` —— 转义在前面就做过了，这时候 `>` 已经
+    // 变成实体了。用 `>` 去匹配会永远匹配不上，而且**不报错**：引用会渲染成一个
+    // 普通的、以 `&gt;` 开头的段落。
+    const quote = raw.match(/^\s*&gt;\s?(.*)$/);
+    if (quote) {
+      openBlock("blockquote");
+      out.push(`<div>${quote[1]}</div>`);
+      continue;
+    }
+
+    closeBlock();
 
     const isRow = /^\s*\|.*\|\s*$/.test(raw);
     if (isRow && /^\s*\|[\s:|-]+\|\s*$/.test(raw)) continue;  // 分隔行
@@ -553,12 +613,23 @@ function markdown(text) {
     if (head) { const n = head[1].length + 2; out.push(`<h${n}>${head[2]}</h${n}>`); continue; }
     out.push(raw.trim() === "" ? "" : `<div>${raw}</div>`);
   }
+  closeBlock();
   if (inTable) out.push("</table>");
   if (inCode) out.push("</code></pre>");
 
+  // 行内格式在拼完之后统一做。顺序有讲究：
+  //   · `**粗体**` 必须在 `*斜体*` 前面 —— 反过来会把粗体的星号吃掉
+  //   · 代码必须在斜体前面 —— 代码里的 `*` 是内容，不是标记
   return out.join("\n")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>");
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (all, label, href) => {
+      // 只放行 http/https。`[点我](javascript:...)` 是个真的 XSS 入口，而这个
+      // 页面会把模型输出直接插进 DOM —— 模型输出是数据，不是可信代码。
+      if (!/^https?:\/\//i.test(href)) return label;
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    })
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
 }
 
 // 不是 newSession() —— 先试着接回上次那个会话，接不回去才开新的。
