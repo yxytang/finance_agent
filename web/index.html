@@ -353,8 +353,11 @@ function connect() {
 
 // --- 渲染 ---------------------------------------------------------------
 
-function bubble(cls) {
-  const node = el("div", "msg " + cls);
+// `text` 要往后传。以前这里只声明了 `cls`，而 `bubble("user", ev.text)` 照样能调用
+// —— JS 不检查参数个数，多余的实参**静默丢掉**。表现是：你提的问题根本不显示，
+// 而控制台干干净净。`el()` 的第三个参数才是「谁的话」。
+function bubble(cls, text) {
+  const node = el("div", "msg " + cls, text);
   log.appendChild(node);
   return node;
 }

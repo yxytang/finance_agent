@@ -552,6 +552,14 @@ def _markdown_source() -> str:
     return js[js.index("function markdown(text)"): js.index("// 不是 newSession")]
 
 
+def _js_function(name: str) -> str:
+    """抠出一个顶层函数的源码（到第一个顶格的 `}` 为止）。"""
+    html = _INDEX.read_text(encoding="utf-8")
+    js = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)[-1]
+    start = js.index("function " + name + "(")
+    return js[start: js.index("\n}", start) + 2]
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="没有 node，跑不了前端脚本")
 def test_markdown_renders_lists_quotes_and_links():
     cases = [
@@ -595,6 +603,40 @@ if (code.includes('<ul>') || code.includes('<blockquote>')) {
 
     result = subprocess.run(
         ["node", "-e", _markdown_source() + checks],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="没有 node，跑不了前端脚本")
+def test_bubble_forwards_its_text():
+    """**你提的问题能显示出来，靠的就是这条。**
+
+    `bubble("user", ev.text)` 和 `bubble("stopped", ev.text)` 都传了两个实参，而
+    从前 `bubble` 只声明了 `cls` —— JS **不检查参数个数**，多出来的那个直接丢掉。
+    表现是：问句不显示、停止提示不显示，控制台一句错都没有。`.msg.user` 和
+    `.msg.stopped` 两条样式一直在那儿，等的文本从来没到过。
+
+    上一版测试没抓住它，因为验的是**事件载荷**（`fa/events.py` 确实发了 `text`），
+    而不是**渲染**。载荷对、界面空，这中间的那一步以前没有任何测试。
+    """
+    checks = """
+const document = { createElement: () => ({ className: "", textContent: undefined }) };
+const log = { appendChild: () => {} };
+%s
+%s
+const node = bubble("user", "上个月外卖花了多少");
+if (node.textContent !== "上个月外卖花了多少") {
+  console.error("bubble 把文本丢了，拿到的是 " + JSON.stringify(node.textContent));
+  process.exit(1);
+}
+""" % (_js_function("el"), _js_function("bubble"))
+
+    result = subprocess.run(
+        ["node", "-e", checks],
         capture_output=True,
         text=True,
         encoding="utf-8",
