@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>finance_agent</title>
+<!--
+  单文件、零构建、原生 JS。
+
+  唯一的外部依赖是 Chart.js 的 CDN —— 离线时图不会出，但对话照常。
+  这是刻意的取舍：把 Chart.js 那份几百 KB 塞进这个文件，会让它没法读。
+
+  ## 这个界面和普通聊天界面的区别
+
+  普通聊天是「问 → 等两秒 → 出答案」。这个 agent 一轮要跑几十秒，中间有多次
+  工具往返。所以界面必须**把过程显示出来** —— 用户要能判断它是不是走偏了，
+  而不是盯着一个转圈的图标等四十秒然后拿到一个不知道从哪来的数字。
+
+  所以工具调用是**一等公民**，不是收起来的调试信息。
+-->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2b3038;
+    --fg: #dfe3ea; --dim: #8b93a1; --accent: #6aa9ff;
+    --ok: #4ec9a0; --warn: #e0a458; --bad: #e06c75;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.65 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  #status { font-size: 12px; color: var(--dim); margin-left: auto; }
+  #status.on { color: var(--ok); }
+  #status.off { color: var(--bad); }
+  button {
+    background: #2a3038; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 11px; cursor: pointer; font-size: 13px;
+  }
+  button:hover { background: #333a44; }
+  button:disabled { opacity: .45; cursor: default; }
+
+  main { flex: 1; overflow-y: auto; padding: 18px 16px 8px; }
+  .wrap { max-width: 820px; margin: 0 auto; }
+
+  .msg { margin-bottom: 16px; }
+  .msg.user {
+    background: #22303f; border-radius: 10px; padding: 8px 13px;
+    margin-left: auto; max-width: 78%; width: fit-content;
+  }
+  .msg.answer { background: var(--panel); border-radius: 10px; padding: 12px 15px; }
+  .msg.answer :first-child { margin-top: 0; }
+  .msg.answer :last-child { margin-bottom: 0; }
+  .msg.answer table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 14px; }
+  .msg.answer th, .msg.answer td { border: 1px solid var(--line); padding: 4px 9px; text-align: left; }
+  .msg.answer th { background: #232833; }
+  .msg.answer code { background: #232833; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  .msg.answer pre { background: #232833; padding: 10px; border-radius: 6px; overflow-x: auto; }
+  .msg.answer pre code { background: none; padding: 0; }
+
+  .tool {
+    border-left: 2px solid var(--line); margin: 7px 0 7px 4px; padding: 3px 0 3px 12px;
+    font-size: 13px;
+  }
+  .tool .head { display: flex; gap: 8px; align-items: baseline; }
+  .tool .name { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
+  .tool .args { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool .out {
+    color: var(--dim); font-family: ui-monospace, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+    max-height: 3.3em; overflow: hidden; cursor: pointer; margin-top: 2px;
+  }
+  .tool .out.open { max-height: 26em; overflow-y: auto; }
+  .tool.failed .name { color: var(--bad); }
+  .tool .chart { margin-top: 8px; max-width: 620px; }
+
+  .note {
+    border-radius: 8px; padding: 8px 12px; font-size: 13px; margin: 10px 0;
+    background: #2a2529; color: var(--warn); border: 1px solid #3d3438;
+  }
+  .note.bad { background: #2c2224; color: var(--bad); border-color: #46302f; }
+  .note.dim { background: #22262c; color: var(--dim); border-color: var(--line); }
+
+  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 16px; }
+  .composer { max-width: 820px; margin: 0 auto; display: flex; gap: 9px; }
+  textarea {
+    flex: 1; resize: none; background: #14171c; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 8px;
+    padding: 9px 11px; font: inherit; height: 46px; max-height: 160px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+
+  dialog {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px; max-width: 440px;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  dialog p { margin: 0 0 14px; }
+  dialog .row { display: flex; gap: 9px; justify-content: flex-end; }
+  dialog button.primary { background: #2d4a6b; border-color: #3c5f85; }
+  .hint { color: var(--dim); font-size: 12px; max-width: 820px; margin: 7px auto 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>finance_agent</h1>
+  <span id="status">连接中…</span>
+  <button id="new">新会话</button>
+</header>
+
+<main><div class="wrap" id="log"></div></main>
+
+<footer>
+  <div class="composer">
+    <textarea id="input" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+    <button id="send" class="primary" style="background:#2d4a6b;border-color:#3c5f85">发送</button>
+  </div>
+  <div class="hint">工具调用会实时显示 —— 这样你能看出它有没有走偏，而不是干等一个数字。</div>
+</footer>
+
+<dialog id="confirm">
+  <p id="confirm-text"></p>
+  <div class="row">
+    <button id="deny">拒绝</button>
+    <button id="allow" class="primary">允许</button>
+  </div>
+</dialog>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const log = $("log");
+
+let sessionId = null;
+let source = null;
+let busy = false;
+let current = null;   // 正在渲染的那条 assistant 气泡
+
+// --- 工具 ---------------------------------------------------------------
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  return data;
+}
+
+function setStatus(text, cls) {
+  $("status").textContent = text;
+  $("status").className = cls || "";
+}
+
+function setBusy(value) {
+  busy = value;
+  $("send").disabled = value;
+  $("input").disabled = value;
+  if (!value) $("input").focus();
+}
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+// --- 会话 ---------------------------------------------------------------
+
+async function newSession() {
+  if (source) source.close();
+  log.innerHTML = "";
+  current = null;
+  setBusy(false);
+  try {
+    const { id } = await api("/api/sessions", {});
+    sessionId = id;
+    connect();
+  } catch (err) {
+    setStatus("开不了会话：" + err.message, "off");
+  }
+}
+
+function connect() {
+  source = new EventSource(`/api/sessions/${sessionId}/events`);
+  source.onopen = () => setStatus("已连接", "on");
+  source.onerror = () => {
+    // EventSource 自己会重连，所以这里不关它 —— 只把状态显示出来，
+    // 免得用户对着一个看起来正常的界面等一个永远不会来的回复。
+    setStatus("断开，重连中…", "off");
+  };
+  source.onmessage = (e) => {
+    try {
+      render(JSON.parse(e.data));
+    } catch (err) {
+      console.error("事件解析失败", e.data, err);
+    }
+  };
+}
+
+// --- 渲染 ---------------------------------------------------------------
+
+function bubble(cls) {
+  const node = el("div", "msg " + cls);
+  log.appendChild(node);
+  return node;
+}
+
+function scroll() { log.parentElement.scrollTop = log.parentElement.scrollHeight; }
+
+function render(ev) {
+  switch (ev.type) {
+    case "connected":
+      setStatus("已连接", "on");
+      break;
+
+    case "turn_start":
+      bubble("user", ev.text);
+      current = bubble("answer");
+      setBusy(true);
+      break;
+
+    case "turn_end":
+      current = null;
+      setBusy(false);
+      break;
+
+    case "step_start":
+      // 步号不显示 —— 它对人没有意义，工具调用本身就说明了在干什么。
+      break;
+
+    case "tool_call":
+      addTool(ev);
+      break;
+
+    case "tool_result":
+      fillTool(ev);
+      break;
+
+    case "chart":
+      addChart(ev);
+      break;
+
+    case "answer":
+      if (current) current.innerHTML = markdown(ev.text);
+      break;
+
+    case "error":
+      (current || bubble("answer")).appendChild(el("div", "note bad", ev.message));
+      break;
+
+    case "confirm_request":
+      askConfirm(ev.summary);
+      break;
+
+    case "confirm_timeout":
+      (current || bubble("answer")).appendChild(el("div", "note", ev.message));
+      break;
+  }
+  scroll();
+}
+
+// 工具卡片按 call_id 索引，这样结果回来时能找到发起它的那一行。
+const toolCards = {};
+
+function addTool(ev) {
+  const card = el("div", "tool");
+  card.dataset.call = ev.call_id;
+
+  const head = el("div", "head");
+  head.appendChild(el("span", "name", "→ " + ev.name));
+  head.appendChild(el("span", "args", JSON.stringify(ev.args)));
+  card.appendChild(head);
+
+  (current || bubble("answer")).appendChild(card);
+  toolCards[ev.call_id] = card;
+}
+
+function fillTool(ev) {
+  const card = toolCards[ev.call_id] || (current || bubble("answer"));
+  if (!ev.ok) card.classList.add("failed");
+
+  const out = el("div", "out", ev.content);
+  out.onclick = () => out.classList.toggle("open");
+  out.title = "点一下展开/收起";
+  card.appendChild(out);
+}
+
+function addChart(ev) {
+  const card = toolCards[ev.call_id];
+  if (!card || typeof Chart === "undefined") return;
+
+  const box = el("div", "chart");
+  const canvas = el("canvas");
+  box.appendChild(canvas);
+  card.appendChild(box);
+
+  // 长标签（商户名）用横向柱状图，纵向的话标签会挤成一团。
+  const byValue = ev.order === "数值";
+  const rows = ev.rows.slice(0, 10);
+  const palette = ["#6aa9ff", "#4ec9a0", "#e0a458", "#e06c75", "#a78bfa",
+                   "#38bdf8", "#f472b6", "#facc15", "#34d399", "#fb923c"];
+
+  new Chart(canvas, {
+    type: byValue ? "bar" : "line",
+    data: {
+      labels: rows.map((r) => r.label),
+      datasets: [{
+        label: (byValue ? "金额" : "支出") + "（" + ev.group + "）",
+        data: rows.map((r) => r.value),
+        backgroundColor: byValue ? rows.map((_, i) => palette[i % palette.length]) : "#6aa9ff33",
+        borderColor: "#6aa9ff",
+        borderWidth: byValue ? 0 : 2,
+        fill: !byValue,
+        tension: 0.25,
+      }],
+    },
+    options: {
+      indexAxis: byValue ? "y" : "x",
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const row = rows[ctx.dataIndex];
+              return `${row.value.toLocaleString()}　(${row.count} 笔)`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: { ticks: { color: "#8b93a1" }, grid: { color: "#2b3038" } },
+        y: { ticks: { color: "#8b93a1" }, grid: { color: "#2b3038" } },
+      },
+    },
+  });
+}
+
+// --- 权限确认 -----------------------------------------------------------
+
+let confirmTimer = null;
+
+function askConfirm(summary) {
+  const dialog = $("confirm");
+  $("confirm-text").textContent = summary;
+  dialog.showModal();
+  // 界面这边也要有超时，和后端的 CONFIRM_TIMEOUT 对齐 ——
+  // 后端超时之后按钮再点也没用了，不如自己先关掉。
+  clearTimeout(confirmTimer);
+  confirmTimer = setTimeout(() => dialog.open && dialog.close(), 290000);
+}
+
+async function answer(allow) {
+  clearTimeout(confirmTimer);
+  $("confirm").close();
+  try {
+    await api(`/api/sessions/${sessionId}/confirm`, { allow });
+  } catch (err) {
+    console.error("回复确认失败", err);
+  }
+}
+
+$("allow").onclick = () => answer(true);
+$("deny").onclick = () => answer(false);
+
+// --- 发送 ---------------------------------------------------------------
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text || busy || !sessionId) return;
+  $("input").value = "";
+  try {
+    await api(`/api/sessions/${sessionId}/messages`, { text });
+  } catch (err) {
+    setBusy(false);
+    (current || bubble("answer")).appendChild(el("div", "note bad", "发不出去：" + err.message));
+    scroll();
+  }
+}
+
+$("send").onclick = send;
+$("input").onkeydown = (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+};
+$("new").onclick = newSession;
+
+// --- 一点极简的 markdown ------------------------------------------------
+
+// 只处理模型实际会用的那几种：表格、标题、加粗、行内代码、代码块。
+// 引一个 markdown 库也可以，但那样这个文件就不是「一眼能读完」的了。
+function markdown(text) {
+  const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const lines = esc(text).split("\n");
+  const out = [];
+  let inTable = false, inCode = false;
+
+  for (const raw of lines) {
+    if (raw.trim().startsWith("```")) {
+      out.push(inCode ? "</code></pre>" : "<pre><code>");
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) { out.push(raw); continue; }
+
+    const isRow = /^\s*\|.*\|\s*$/.test(raw);
+    if (isRow && /^\s*\|[\s:|-]+\|\s*$/.test(raw)) continue;  // 分隔行
+    if (isRow !== inTable) { out.push(isRow ? "<table>" : "</table>"); inTable = isRow; }
+    if (isRow) {
+      const cells = raw.trim().slice(1, -1).split("|")
+        .map((c) => `<td>${c.trim()}</td>`).join("");
+      out.push(`<tr>${cells}</tr>`);
+      continue;
+    }
+    const head = raw.match(/^(#{1,4})\s+(.*)$/);
+    if (head) { const n = head[1].length + 2; out.push(`<h${n}>${head[2]}</h${n}>`); continue; }
+    out.push(raw.trim() === "" ? "" : `<div>${raw}</div>`);
+  }
+  if (inTable) out.push("</table>");
+  if (inCode) out.push("</code></pre>");
+
+  return out.join("\n")
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>");
+}
+
+newSession();
+</script>
+</body>
+</html>

@@ -102,6 +102,24 @@ def test_unknown_merchant_lists_what_can_be_corrected(paths):
     assert "target" in out and "starbucks" in out
 
 
+def test_rule_covered_merchant_says_why_it_cannot_be_corrected(paths):
+    """**规则层管的商户进不了缓存，所以纠正不了。**
+
+    规则排在缓存前面，命中了就不会问 LLM，也就永远不会被写进缓存。而
+    `correct_category` 只改缓存 —— 对这类商户是**静默无效**的。
+
+    所以错误信息必须说清楚「它归规则管，去改代码」，而不是含糊的「缓存里没有」。
+    后者会让用户以为这是 bug，然后反复重试。
+
+    注意这里用的 `netflix` 不在 fixture 的缓存里 —— 那正是真实情况：规则命中的
+    商户根本不会进缓存。用 fixture 里已有的商户测这条会走进另一个分支。
+    """
+    out = tool().invoke({"merchant": "netflix", "category": "娱乐"})  # 规则说它是「订阅」
+
+    assert "规则层" in out
+    assert "fa/categorize.py" in out  # 得告诉他去哪改
+
+
 def test_invalid_category_lists_the_valid_ones(paths):
     out = tool().invoke({"merchant": "target", "category": "伙食费"})
 

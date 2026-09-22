@@ -17,7 +17,7 @@ from datetime import date
 
 from langchain_core.tools import BaseTool, tool
 
-from fa.categorize import CategoryCache
+from fa.categorize import CategoryCache, match_rule
 from fa.config import CATEGORIES
 from fa.memory import Memory, add
 from fa.normalize import normalize
@@ -54,8 +54,19 @@ def build_categorize_tools(confirm: Confirm | None = None) -> list[BaseTool]:
         key = normalize(merchant)
 
         if key not in cache.entries:
-            # 纠正的前提是这个商户已经被判过类。没判过说明它还没进过 LLM 那层，
-            # 先跑一次 `python -m data.categorize` 才有得纠正。
+            # 分两种情况说，因为**修法完全不同**：
+
+            if match_rule(key):
+                # 规则层的商户进不了缓存（规则排在缓存前面，命中了就不会问 LLM，
+                # 也就永远不会被写进缓存）。所以「缓存里没有」在这里的意思不是
+                # 「不认识这个商户」，而是「它归规则管，改缓存对它没用」。
+                # 不说清楚的话，用户会以为纠正失败是 bug。
+                return (
+                    f"「{key}」归**规则层**管（规则表里写死了它是「{match_rule(key)}」），"
+                    "改缓存对它不起作用 —— 规则每次重算，而且排在缓存前面。\n"
+                    "要改它得改 `fa/categorize.py` 里的 RULES 表。"
+                )
+
             known = "、".join(sorted(cache.entries)) or "（缓存是空的）"
             return (
                 f"缓存里没有「{key}」这个商户，没法纠正。\n"

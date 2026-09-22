@@ -36,6 +36,12 @@ eval = [
     "ragas",
     "langchain-community<0.4",
 ]
+# 第九天的 Web 前端单独列 —— CI 不需要它（前端代码在这个项目里没有测试，
+# 而后端那部分只用标准库 + FastAPI 的数据结构）。
+web = [
+    "fastapi",
+    "uvicorn",
+]
 dev = ["pytest"]
 
 [tool.pytest.ini_options]
