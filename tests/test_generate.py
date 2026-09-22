@@ -2,20 +2,33 @@
 
 这里钉的是两条**地基性质**：
 
-  1. **确定性** —— 换个种子数据就变、同一句话跑两次结果不一样，那
-     findings.md 里的分数第二天就复现不出来了，它也就不是评测集了。
+  1. **可复现** —— 同 seed + 同结束日必得同一份数据。结束日默认跟今天走，
+     所以「跑两次一样」说的是**同一天内**；要跨天复现就得把 `--end` 钉回去。
+     月数、总数都随结束日变，所以这里一律**不断言具体月数或总数** —— 断言
+     那些会把这条测试变成定时炸弹。
   2. **6 个坑真的在数据里** —— 后面所有异常检测的评测都拿它们当真值。
      坑没了而没人发现，评测会「全过」，那比失败更糟。
 """
 
 from collections import Counter
+from datetime import date
 
 import pytest
 
-from data.generate import build, check_traps, write_csv, write_reference
+from data.generate import START, build, check_traps, write_csv, write_reference
 from fa.config import CATEGORIES
 
 RENT = "PACIFIC PROPERTY MGMT RENT"
+
+
+def _month_range(first: date, last: date) -> set[str]:
+    """首月到末月之间**应该存在**的所有 year_month，含首尾。"""
+    out: set[str] = set()
+    year, month = first.year, first.month
+    while (year, month) <= (last.year, last.month):
+        out.add(f"{year:04d}-{month:02d}")
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -42,6 +55,25 @@ def test_different_seed_gives_a_different_bill():
     a, _ = build()
     b, _ = build(seed=1)
     assert [t.amount for t in a] != [t.amount for t in b]
+
+
+def test_extending_the_end_date_only_appends():
+    """延长结束日只能是**追加**，前面一笔都不能动。
+
+    「把账单延到今天」这件事能不能成立，全看这条：`end` 不参与抽样，所以换个
+    结束日拿到的永远是同一条随机序列的前缀。一旦有人把 `end` 混进某个 `rng.*`
+    调用，前面几个月会整体错位 —— 而**没有任何报错**，只有一堆对不上的数字，
+    连那 6 个坑都可能悄悄挪走。
+    """
+    cutoff = date(2026, 3, 31)
+    short, _ = build(end=cutoff)
+    long, _ = build(end=date(2026, 6, 30))
+
+    prefix = [t for t in long if t.date <= cutoff]
+
+    assert [t.date for t in prefix] == [t.date for t in short]
+    assert [t.merchant for t in prefix] == [t.merchant for t in short]
+    assert [t.amount for t in prefix] == [t.amount for t in short]
 
 
 # --- 6 个坑 -------------------------------------------------------------
@@ -84,20 +116,25 @@ def test_trap_six_does_not_depend_on_a_lucky_draw(bill):
 
 def test_size_and_span(bill):
     transactions, _ = bill
+    months = len({t.year_month for t in transactions})
 
-    assert 900 <= len(transactions) <= 1300
-    assert str(transactions[0].date).startswith("2025-")
-    assert str(transactions[-1].date).startswith("2026-")
+    # 上下界按「每月多少笔」给，不写死总数 —— 总数随结束日变（见 generate.py
+    # 的 docstring），写死它就是个定时炸弹。
+    assert 50 * months <= len(transactions) <= 120 * months
+    assert transactions[0].date >= START
+    assert transactions[-1].date <= date.today()
 
 
-def test_covers_twelve_months_with_no_gap(bill):
-    """每个月都得有交易 —— 空月份会让「按月分组」的测试碰到一个不存在的桶，
-    而那种失败看起来像查询 bug，其实怪数据。"""
+def test_no_month_is_empty(bill):
+    """首月到末月之间一个月都不能少。
+
+    空月份会让「按月分组」的测试碰到一个不存在的桶，而那种失败看起来像查询
+    bug，其实怪数据。**断言的是没有空档，不是月数** —— 月数会随结束日变。
+    """
     transactions, _ = bill
-
     months = Counter(t.year_month for t in transactions)
 
-    assert len(months) == 12
+    assert set(months) == _month_range(transactions[0].date, transactions[-1].date)
     assert min(months.values()) > 0
 
 
@@ -107,7 +144,7 @@ def test_monthly_items_appear_in_every_month(bill):
 
     rent = [t for t in transactions if t.merchant == RENT]
 
-    assert len(rent) == 12
+    assert len(rent) == len(every_month)
     assert {t.year_month for t in rent} == every_month
 
 

@@ -4,9 +4,16 @@
 真实账单既不能公开、类目也得自己标，而合成数据能让 ground truth 完全可控 ——
 包括**故意埋进去的坑**。
 
-**为什么日期范围写死。** `2025-09-01 ~ 2026-08-31` 固定不动。改成「相对今天」
-会让数据随运行时间漂移，findings.md 里的数字就全废了 —— 一个评测集如果每次
-跑出来不一样，它就不是评测集。
+**为什么结束日跟今天走。** `START` 和 `SEED` 钉死，只有结束日取 `date.today()`。
+这是为了让「本月」在数据里**真实存在** —— 预测类功能需要一个当下的靶子，
+否则「这个月还没过完」这条边界永远只能在纸面上讨论。
+
+代价是数据不再随时间不变：今天生成和明天生成的不一样。要复现某次分析就
+**记下当时的结束日**，用 `--end` 把它钉回去，会得到同一份数据。可复现靠的是
+「同 seed + 同 end」，不是「永远同一份文件」。
+
+（顺带：`--end` 早于最后一个坑的日期时，那个坑会被裁掉，`--check` 会如实报红。
+这是对的 —— 反查验的是数据，不是生成代码的意图。）
 
 ## 埋的 6 个坑
 
@@ -25,8 +32,9 @@
 
 ## 用法
 
-    python -m data.generate            # 生成 transactions.csv + reference.csv
-    python -m data.generate --check    # 只验证 6 个坑还在不在
+    python -m data.generate                    # 生成到今天的账单
+    python -m data.generate --end 2026-08-31   # 钉住结束日，复现旧分析
+    python -m data.generate --check            # 只验证 6 个坑还在不在
 """
 
 import argparse
@@ -45,7 +53,6 @@ from fa.models import ZERO, Transaction, money  # noqa: E402
 
 SEED = 20250901
 START = date(2025, 9, 1)
-MONTHS = 12
 
 # 账户：固定的大额走 checking，日常走 credit。真实账单就是分账户导出的。
 CHECKING = "checking"
@@ -150,6 +157,15 @@ TRAP_AMBIGUOUS_MERCHANT = "AMZN Mktp US*2H4KJ"  # 坑 6
 TRAP_AMBIGUOUS_SPREAD = Decimal("10")           # 最大/最小至少差这么多倍
 
 
+def _months_to_cover(end: date) -> int:
+    """START 所在月到 end 所在月，含首尾，一共要生成几个月。
+
+    末月通常是残缺的（只过到 end 那天），由 `generate()` 在最后裁掉多余的日子，
+    这里只管**要铺几个月**。
+    """
+    return (end.year - START.year) * 12 + (end.month - START.month) + 1
+
+
 def _month_start(index: int) -> date:
     """第 index 个月（0 起）的 1 号。"""
     year = START.year + (START.month - 1 + index) // 12
@@ -172,16 +188,22 @@ def _jitter(rng: random.Random, base: Decimal, ratio: float) -> Decimal:
     return money(base * factor)
 
 
-def generate(seed: int = SEED) -> list[tuple]:
-    """产出 (date, merchant, amount, account, category)。
+def generate(seed: int = SEED, end: date | None = None) -> list[tuple]:
+    """产出 (date, merchant, amount, account, category)，只到 end 当天。
 
     返回元组而不是 Transaction，因为 txn_id 要等排序之后再分配 ——
     这样 CSV 读起来是日期递增的，id 也顺。
+
+    `end` 默认今天。它**不参与抽样**，只决定铺几个月、以及最后裁掉哪些行 ——
+    所以换一个 `end` 拿到的永远是同一条随机序列的**前缀**，前面的月份一笔不变。
+    已埋的 6 个坑全靠这条性质才不会被延长数据挤走：别把 `end` 混进任何
+    `rng.*` 调用里。
     """
+    end = end or date.today()
     rng = random.Random(seed)
     entries: list[tuple] = []
 
-    for index in range(MONTHS):
+    for index in range(_months_to_cover(end)):
         month_start = _month_start(index)
 
         for merchant, category, day, base, account, ratio in FIXED_ITEMS:
@@ -225,11 +247,14 @@ def generate(seed: int = SEED) -> list[tuple]:
     entries.append((date(2025, 10, 4), TRAP_AMBIGUOUS_MERCHANT, money("4.99"), CREDIT, "购物"))
     entries.append((date(2026, 5, 16), TRAP_AMBIGUOUS_MERCHANT, money("329.00"), CREDIT, "购物"))
 
+    # 末月裁到 end 当天。统一在这里裁，免得每个来源各写一遍 ——
+    # ONE_OFFS 和 6 个坑都是写死日期的，也一样受这条约束。
+    entries = [row for row in entries if row[0] <= end]
     entries.sort(key=lambda row: (row[0], row[1]))
     return entries
 
 
-def build(seed: int = SEED) -> tuple[list[Transaction], dict[str, str]]:
+def build(seed: int = SEED, end: date | None = None) -> tuple[list[Transaction], dict[str, str]]:
     """返回 (交易列表, txn_id → 真值类目)。
 
     真值单独给出来，是因为它**不能混进 transactions.csv** —— 那是 agent 要读的
@@ -238,7 +263,7 @@ def build(seed: int = SEED) -> tuple[list[Transaction], dict[str, str]]:
     transactions: list[Transaction] = []
     reference: dict[str, str] = {}
 
-    for i, (day, merchant, amount, account, category) in enumerate(generate(seed), start=1):
+    for i, (day, merchant, amount, account, category) in enumerate(generate(seed, end), start=1):
         txn_id = f"T{i:06d}"
         transactions.append(
             Transaction(
@@ -357,17 +382,29 @@ def check_traps(
     return results
 
 
+def _parse_day(text: str) -> date:
+    """命令行里的日期。出错时报清楚它该长什么样。"""
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"日期要写成 YYYY-MM-DD，收到了 {text!r}") from None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m data.generate", description="合成账单生成器")
     parser.add_argument("--out-dir", type=Path, default=None, help="输出目录，默认 data/")
     parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument(
+        "--end", type=_parse_day, default=None,
+        help="结束日 YYYY-MM-DD，默认今天。想复现旧的分析结果就把它钉回去。",
+    )
     parser.add_argument("--check", action="store_true", help="只验证 6 个坑，不写文件")
     args = parser.parse_args(argv)
 
     from fa.config import DATA_DIR
 
     out_dir = args.out_dir or DATA_DIR
-    transactions, reference = build(args.seed)
+    transactions, reference = build(args.seed, args.end)
 
     if args.check:
         results = check_traps(transactions, reference)
