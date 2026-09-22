@@ -89,17 +89,20 @@ MAX_RESOURCE = 60_000
 REQUEST_TIMEOUT = 120
 
 
-def build_model(**kwargs) -> ChatOpenAI:
+def build_model(cls=ChatOpenAI, **kwargs) -> ChatOpenAI:
     """构造模型。DeepSeek 走 OpenAI 兼容接口。
 
     没 key 就直接报错，而不是构造出一个每次调用都 401 的客户端 ——
     让配置问题在启动时暴露，而不是等第一次对话。
+
+    `cls` 可以换成别的实现（比如带重试的包装），用来应对**同一套配置**下的
+    不同健壮性需求。默认就是原生的 ChatOpenAI。
     """
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError(f"没找到 DEEPSEEK_API_KEY，请填进 {ENV_FILE}")
 
-    return ChatOpenAI(
+    return cls(
         model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
         base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         api_key=api_key,

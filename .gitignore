@@ -18,3 +18,8 @@ memory/*.md
 
 # 注意：data/transactions.csv 和 data/reference.csv **要提交**。
 # 别人 clone 下来一条命令就能跑，不用先自己生成一遍。
+
+# 评测的原始采集结果。**不提交** —— 但 findings.md 提交。
+# 理由：原始数据取决于跑的时候模型状态（内容过滤、温度抖动），
+# 它不可复现；而 findings.md 里的结论是给人看的。
+eval/last_run.json

@@ -21,9 +21,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# 第八天的 RAGAS 单独列，因为它会带进 datasets / pyarrow / numpy 一串重依赖，
-# 而日常开发和 CI 完全用不到 —— 装它会白白拖慢 CI。
-eval = ["ragas"]
+# 第八天的 RAGAS 单独列 —— 它会带进 datasets / pyarrow / numpy / pandas
+# 一串重依赖，而日常开发和 CI 完全用不到。
+#
+# **`langchain-community` 的上限不是可选的。** ragas 0.4.3 在模块顶层 import 了
+# `langchain_community.chat_models.vertexai`，但它声明依赖时没给
+# `langchain-community` 设上限 —— 装最新的 0.4.x 会直接 import 失败：
+#
+#     ModuleNotFoundError: No module named 'langchain_community.chat_models.vertexai'
+#
+# 0.3.31 还带着那个模块，而且不会连带降级 langchain-core / langchain-openai。
+# 这是 ragas 的打包问题，不是我们的；等它修了就能去掉这个上限。
+eval = [
+    "ragas",
+    "langchain-community<0.4",
+]
 dev = ["pytest"]
 
 [tool.pytest.ini_options]
