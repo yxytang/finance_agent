@@ -274,6 +274,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # **stdout 的编码必须自己钉死。** 中文 Windows 上它默认跟 locale 走（cp936），
+    # 而协议的另一端（fa/mcp/client.py）是按 UTF-8 读的 —— 工具描述里第一个中文
+    # 就会让对面解码失败，报成一个看不懂的 UnicodeDecodeError，表现为「连不上
+    # MCP server」，而真正的原因在编码上。
+    #
+    # 下面 `ensure_ascii=False` 是为了让协议可读，代价正是「得自己保证编码」。
+    #
+    # 只在 main 里做，不放模块级：模块级会在 import 时就改掉调用方的 stdout，
+    # 而这个模块是要被测试 import 的。
+    sys.stdout.reconfigure(encoding="utf-8")
+
     if not args.data.is_file():
         log(f"找不到账单：{args.data}")
         return 1

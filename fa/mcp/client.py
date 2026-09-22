@@ -113,7 +113,18 @@ class StdioClient:
         assert self._process is not None and self._process.stdout is not None
 
         while True:
-            line = self._process.stdout.readline()
+            try:
+                line = self._process.stdout.readline()
+            except UnicodeDecodeError as exc:
+                # 对端没把自己的 stdout 编码钉死时就是这样：它按 locale 写
+                # （中文 Windows 上是 cp936），我们按 UTF-8 读。不拦这一下的话
+                # 报出来的是 UnicodeDecodeError，而真正的原因（协议通道的编码
+                # 不对）离它很远 —— 看起来像客户端坏了。
+                raise MCPError(
+                    "MCP server 写出来的不是 UTF-8，多半是它的 stdout 跟着系统 "
+                    f"locale 走了。协议通道必须是 UTF-8（服务器应在启动时 "
+                    f"reconfigure）。原始错误：{exc}"
+                ) from exc
             if not line:
                 raise MCPError("MCP server 没打招呼就退出了（stdout 到 EOF）")
 

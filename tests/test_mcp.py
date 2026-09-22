@@ -22,6 +22,14 @@ T2,2026-01-06,SAFEWAY #9,120.00,credit
 T3,2026-02-01,PACIFIC PROPERTY MGMT RENT,3250.00,checking
 """
 
+# 起「故意往协议通道里写坏东西」的子进程时，先把这个拼在前面。
+#
+# **必须先把子进程的 stdout 钉成 UTF-8**，否则在中文 Windows 上它会按 cp936
+# 写中文，客户端读的时候先解码失败了 —— 于是这几条测试测的是编码，而不是它们
+# 本来要测的「非 JSON 回复」「非 JSON-RPC 对象」。（真的踩过：没有这个前缀时
+# 它们只在设了 PYTHONIOENCODING 的机器上才是绿的。）
+_UTF8 = "import sys; sys.stdout.reconfigure(encoding='utf-8'); "
+
 
 @pytest.fixture
 def ledger(tmp_path):
@@ -192,7 +200,7 @@ def test_client_reports_a_missing_server_clearly():
 
 def test_client_rejects_a_non_json_reply():
     """服务端往协议通道里写了非 JSON 的东西（比如一行调试输出）。"""
-    client = StdioClient([sys.executable, "-c", "print('这不是 JSON')"])
+    client = StdioClient([sys.executable, "-c", _UTF8 + "print('这不是 JSON')"])
     client.start()
     try:
         with pytest.raises(MCPError) as exc:
@@ -209,12 +217,36 @@ def test_client_rejects_a_non_object_reply():
     会抛 AttributeError —— 而那个报错离真正的原因（服务端往协议通道里写了
     非协议内容）很远。
     """
-    client = StdioClient([sys.executable, "-c", "print('\"一个裸字符串\"')"])
+    client = StdioClient([sys.executable, "-c", _UTF8 + "print('\"一个裸字符串\"')"])
     client.start()
     try:
         with pytest.raises(MCPError) as exc:
             client.request("tools/list")
         assert "JSON-RPC" in str(exc.value)
+    finally:
+        client.close()
+
+
+def test_client_reports_non_utf8_bytes_as_a_protocol_error():
+    """对端写出来的不是 UTF-8 时，要报成协议错误，而不是 UnicodeDecodeError。
+
+    这个坑真的踩过：ledger_server 没把自己的 stdout 编码钉死，在中文 Windows 上
+    按 cp936 写中文工具描述，客户端一读就崩 —— 表现是「连不上 MCP server」，
+    整个 web 应用起不来，而报错里一个「编码」字样都没有。
+
+    这里**显式写非法字节**，不用 `print(中文)`：后者在 UTF-8 环境下（比如 CI 上
+    的 Linux）压根不触发，那这条测试就只在中文 Windows 上有意义了。
+    """
+    client = StdioClient([
+        sys.executable,
+        "-c",
+        r"import sys; sys.stdout.buffer.write(b'\xff\xfe not utf8\n'); sys.stdout.buffer.flush()",
+    ])
+    client.start()
+    try:
+        with pytest.raises(MCPError) as exc:
+            client.request("tools/list")
+        assert "UTF-8" in str(exc.value)
     finally:
         client.close()
 
