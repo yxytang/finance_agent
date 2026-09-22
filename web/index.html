@@ -29,8 +29,30 @@
   body {
     margin: 0; background: var(--bg); color: var(--fg);
     font: 15px/1.65 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-    display: flex; flex-direction: column; height: 100vh;
+    display: flex; height: 100vh;
   }
+  /* 侧栏是**会话列表**，不是导航 —— 它存在的理由是服务端留了回放，
+     而之前没有任何入口能走回去（刷新就开新会话）。 */
+  #sidebar {
+    width: 212px; flex: none; border-right: 1px solid var(--line);
+    background: var(--panel); display: flex; flex-direction: column; overflow: hidden;
+  }
+  .side-head {
+    display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+    border-bottom: 1px solid var(--line); font-size: 13px; color: var(--dim);
+  }
+  .side-head button { margin-left: auto; padding: 2px 10px; }
+  #sessions { flex: 1; overflow-y: auto; padding: 6px; }
+  .session {
+    display: block; width: 100%; text-align: left; margin-bottom: 3px;
+    background: none; border: 1px solid transparent; border-radius: 6px;
+    padding: 6px 9px; cursor: pointer; font-size: 13px;
+  }
+  .session:hover { background: #232833; }
+  .session.active { background: #22303f; border-color: #3c5f85; }
+  .session .sid { display: block; font-family: ui-monospace, Consolas, monospace; }
+  .session .meta { display: block; color: var(--dim); font-size: 11px; margin-top: 1px; }
+  .pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   header {
     display: flex; align-items: center; gap: 12px;
     padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
@@ -109,21 +131,30 @@
 </head>
 <body>
 
-<header>
-  <h1>finance_agent</h1>
-  <span id="status">连接中…</span>
-  <button id="new">新会话</button>
-</header>
-
-<main><div class="wrap" id="log"></div></main>
-
-<footer>
-  <div class="composer">
-    <textarea id="input" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
-    <button id="send" class="primary" style="background:#2d4a6b;border-color:#3c5f85">发送</button>
+<aside id="sidebar">
+  <div class="side-head">
+    <span>会话</span>
+    <button id="new" title="开一个新会话">＋</button>
   </div>
-  <div class="hint">工具调用会实时显示 —— 这样你能看出它有没有走偏，而不是干等一个数字。</div>
-</footer>
+  <div id="sessions"></div>
+</aside>
+
+<div class="pane">
+  <header>
+    <h1>finance_agent</h1>
+    <span id="status">连接中…</span>
+  </header>
+
+  <main><div class="wrap" id="log"></div></main>
+
+  <footer>
+    <div class="composer">
+      <textarea id="input" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="send" class="primary" style="background:#2d4a6b;border-color:#3c5f85">发送</button>
+    </div>
+    <div class="hint">工具调用会实时显示 —— 这样你能看出它有没有走偏，而不是干等一个数字。</div>
+  </footer>
+</div>
 
 <dialog id="confirm">
   <p id="confirm-text"></p>
@@ -141,6 +172,7 @@ let sessionId = null;
 let source = null;
 let busy = false;
 let current = null;   // 正在渲染的那条 assistant 气泡
+let sessions = [];    // 服务端认得的会话，最近活动的在前
 
 // --- 工具 ---------------------------------------------------------------
 
@@ -176,17 +208,94 @@ function el(tag, cls, text) {
 
 // --- 会话 ---------------------------------------------------------------
 
-async function newSession() {
+// 会话 id 存两处，缺一不可：
+//   · localStorage —— 刷新之后还认得
+//   · URL hash     —— 开两个标签页时，各自 URL 里的那个才是对的
+// 只存 localStorage 的话两个标签页会互相踩：后开的把前一个的 id 盖掉，
+// 前一个一刷新就跳到别人的会话去了。
+const STORE_KEY = "fa.session";
+
+function remember(id) {
+  sessionId = id;
+  // 无痕模式下 localStorage 会抛。存不进去不影响这次能用，只是刷新后回不来。
+  try { localStorage.setItem(STORE_KEY, id); } catch (err) { /* 忽略 */ }
+
+  const url = new URL(location.href);
+  url.hash = id;
+  history.replaceState(null, "", url);
+}
+
+function recall() {
+  const fromUrl = decodeURIComponent(location.hash.slice(1));
+  if (fromUrl) return fromUrl;
+  try { return localStorage.getItem(STORE_KEY); } catch (err) { return null; }
+}
+
+function openSession(id) {
   if (source) source.close();
   log.innerHTML = "";
   current = null;
   setBusy(false);
+  remember(id);
+  connect();
+  renderList();
+}
+
+async function refreshList() {
+  try {
+    sessions = (await api("/api/sessions")).sessions;
+  } catch (err) {
+    // 列表拉不到不该挡住聊天 —— 顶多是侧栏空着。
+    console.warn("会话列表拉不到", err);
+    return;
+  }
+  renderList();
+}
+
+function when(iso) {
+  const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (mins < 1) return "刚刚";
+  if (mins < 60) return mins + " 分钟前";
+  if (mins < 1440) return Math.round(mins / 60) + " 小时前";
+  return new Date(iso).toLocaleDateString();
+}
+
+function renderList() {
+  const box = $("sessions");
+  box.innerHTML = "";
+  for (const item of sessions) {
+    const node = el("button", "session" + (item.id === sessionId ? " active" : ""));
+    node.appendChild(el("span", "sid", item.id.slice(0, 8)));
+    node.appendChild(
+      el("span", "meta",
+         item.turns + " 轮 · " + (item.busy ? "进行中" : when(item.last_activity)))
+    );
+    node.onclick = () => openSession(item.id);
+    box.appendChild(node);
+  }
+}
+
+async function newSession() {
   try {
     const { id } = await api("/api/sessions", {});
-    sessionId = id;
-    connect();
+    openSession(id);
+    await refreshList();
   } catch (err) {
     setStatus("开不了会话：" + err.message, "off");
+  }
+}
+
+async function boot() {
+  await refreshList();
+
+  // **先在列表里确认这个 id 还在，再连。** 服务一重启所有会话就都没了，
+  // 这时候拿旧 id 去连会一直 404 —— 而 EventSource 会自动重连一个永远不
+  // 成功的地址，界面看起来就是卡住了，且没有任何报错。
+  const wanted = recall();
+  if (wanted && sessions.some((item) => item.id === wanted)) {
+    openSession(wanted);
+  } else {
+    await newSession();
   }
 }
 
@@ -232,6 +341,7 @@ function render(ev) {
     case "turn_end":
       current = null;
       setBusy(false);
+      refreshList();   // 轮数变了，侧栏跟着更新
       break;
 
     case "step_start":
@@ -433,7 +543,8 @@ function markdown(text) {
     .replace(/`([^`]+)`/g, "<code>$1</code>");
 }
 
-newSession();
+// 不是 newSession() —— 先试着接回上次那个会话，接不回去才开新的。
+boot();
 </script>
 </body>
 </html>

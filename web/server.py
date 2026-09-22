@@ -139,6 +139,17 @@ def create_session(request: Request) -> dict:
     return {"id": live.id}
 
 
+@app.get("/api/sessions")
+def list_sessions(request: Request) -> dict:
+    """已有的会话，最近活动的在前。
+
+    **没有这个接口，浏览器就只能自己记一个 id** —— 刷新或换标签页之后那个
+    会话再也回不去，而服务端的回放明明还在。列表是那个回放的入口。
+    """
+    _check(request)
+    return {"sessions": [live.summary() for live in manager.list()]}
+
+
 @app.get("/api/sessions/{session_id}/events")
 def events(session_id: str, request: Request):
     _check(request)

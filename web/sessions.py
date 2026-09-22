@@ -38,6 +38,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from fa.agent import Session
@@ -73,6 +74,15 @@ MAX_EVENTS = 2000
 MAX_SESSIONS = 50
 
 
+def _iso(stamp: float) -> str:
+    """时间戳 → ISO 字符串。浏览器 `new Date(...)` 直接能解。
+
+    用**本地时间**而不是 UTC：这个列表是给人看的，`fromtimestamp` 出的是本机
+    时区。要给机器比对才需要 UTC。
+    """
+    return datetime.fromtimestamp(stamp).isoformat(timespec="seconds")
+
+
 class LiveSession:
     """一个浏览器会话对着一个 agent Session。
 
@@ -87,6 +97,13 @@ class LiveSession:
         self.events: list[dict] = []
         self.listeners: list[queue.Queue] = []
         self.busy = False
+
+        # 会话列表要用的元数据。**没有它，浏览器就只能自己记一个 id** ——
+        # 而 id 一丢（刷新、换标签页、换设备）那个会话就再也找不回来了，
+        # 尽管服务端的回放明明还在，却没有任何入口能走回去。
+        self.created_at = time.time()
+        self.last_activity = self.created_at
+        self.turns = 0
 
         self._pending: threading.Event | None = None
         self._answer = False
@@ -126,6 +143,7 @@ class LiveSession:
             self.events.append(event)
             if len(self.events) > MAX_EVENTS:
                 del self.events[: len(self.events) - MAX_EVENTS]
+            self.last_activity = time.time()
             listeners = list(self.listeners)
 
         for listener in listeners:
@@ -150,6 +168,19 @@ class LiveSession:
         with self.lock:
             if listener in self.listeners:
                 self.listeners.remove(listener)
+
+    def summary(self) -> dict:
+        """会话列表里的一行。**不含对话内容** —— 列表只需要知道「有这么个
+        会话、什么时候动过」，正文要靠连上去回放。"""
+        with self.lock:
+            return {
+                "id": self.id,
+                "created_at": _iso(self.created_at),
+                "last_activity": _iso(self.last_activity),
+                "turns": self.turns,
+                "busy": self.busy,
+                "events": len(self.events),
+            }
 
     # --- 权限确认 -------------------------------------------------------
 
@@ -197,6 +228,8 @@ class LiveSession:
 
         不发的话浏览器的输入框会永远禁用着，而用户完全不知道发生了什么。
         """
+        with self.lock:
+            self.turns += 1
         self.emit({"type": TURN_START, "text": text})
         try:
             self.session.send(text)
@@ -229,6 +262,17 @@ class SessionManager:
     def get(self, session_id: str) -> LiveSession | None:
         with self._lock:
             return self._sessions.get(session_id)
+
+    def list(self) -> list[LiveSession]:
+        """所有会话，最近活动的在前。
+
+        先复制再排序：排序要读每个会话的 `last_activity`，不该在握着 manager
+        的锁时去做（那会把所有请求串起来）。
+        """
+        with self._lock:
+            items = list(self._sessions.values())
+        items.sort(key=lambda live: live.last_activity, reverse=True)
+        return items
 
     def drop(self, session_id: str) -> None:
         with self._lock:

@@ -362,3 +362,66 @@ def test_confirm_callback_is_wired_into_the_tools():
 
     quiet = LiveSession("u", confirm=False)
     assert quiet.session.tool_map  # 不传 confirm 也能正常构造
+
+
+# --- 会话列表用的元数据 -------------------------------------------------
+#
+# 侧栏能不能用，全看这几个字段对不对。在此之前浏览器只能自己记一个 id，
+# 刷新就丢 —— 服务端的回放一直在，却没有任何入口能走回去。
+
+
+def test_summary_carries_what_the_sidebar_needs():
+    live = LiveSession("abc123", confirm=False)
+
+    item = live.summary()
+
+    assert item["id"] == "abc123"
+    assert item["turns"] == 0
+    assert item["busy"] is False
+    assert item["created_at"] == item["last_activity"]
+    # 要能被浏览器的 new Date(...) 直接解。
+    assert "T" in item["created_at"]
+
+
+def test_summary_does_not_leak_the_conversation():
+    """列表只要「有这么个会话」，不要内容 —— 内容靠连上去回放。
+
+    这条是防手滑：`summary()` 里多塞一个正文/消息字段，就等于把会话内容发给了
+    任何能列会话的人。
+    """
+    live = LiveSession("abc123", confirm=False)
+    live.emit({"type": TURN_START, "text": "上个月外卖花了多少"})
+
+    item = live.summary()
+
+    assert set(item) == {"id", "created_at", "last_activity", "turns", "busy", "events"}
+    assert "上个月外卖花了多少" not in str(item)
+
+
+def test_summary_counts_turns():
+    live = LiveSession("abc123", confirm=False)
+    live.session.send = lambda text: None  # 不真跑 agent
+
+    live.run("第一轮")
+    live.run("第二轮")
+
+    assert live.summary()["turns"] == 2
+
+
+def test_manager_list_is_sorted_by_recent_activity():
+    """最近动过的排前面 —— 用户要找的多半是刚才那个。"""
+    manager = SessionManager(confirm=False)
+    stale = manager.create()
+    fresh = manager.create()
+
+    # 直接把时间戳摆好，不靠 sleep 去赌时钟精度（Windows 上分辨率不保证）。
+    stale.last_activity = fresh.last_activity - 60
+
+    assert [item.id for item in manager.list()] == [fresh.id, stale.id]
+
+
+def test_manager_list_includes_everything_it_created():
+    manager = SessionManager(confirm=False)
+    created = {manager.create().id for _ in range(3)}
+
+    assert {item.id for item in manager.list()} == created
