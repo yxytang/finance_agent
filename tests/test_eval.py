@@ -8,6 +8,7 @@
 **「喂给它的东西是完好的吗」**。
 """
 
+import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +19,15 @@ from eval.collect import Recorder, ask
 from eval.qa_cases import ALL, LITERAL, PARAPHRASED
 from eval.ragas_run import sanity_problem, to_dataset
 from fa.config import KNOWLEDGE_DIR
+
+# ragas 在 `eval` extra 里，CI 只装 `.[dev]`（ragas 会带进两百多兆的传递依赖）。
+#
+# 用 `find_spec` 而不是 `pytest.importorskip`：后者的行为随版本变过 ——
+# 它现在只对 `ModuleNotFoundError` 跳过，对别的 `ImportError` 会直接失败
+# （那是有意的，用来区分「没装」和「装了但坏了」）。但这里我想要的是一个
+# **不依赖版本细节**的判断，而且看代码的人一眼就知道在判什么。
+HAS_RAGAS = importlib.util.find_spec("ragas") is not None
+requires_ragas = pytest.mark.skipif(not HAS_RAGAS, reason="需要 eval extra（CI 不装）")
 
 
 # --- 题库 ---------------------------------------------------------------
@@ -172,8 +182,13 @@ def test_ask_gives_up_eventually(monkeypatch):
 # --- 组装数据集 ---------------------------------------------------------
 
 
+@requires_ragas
 def test_dataset_maps_the_ragas_fields():
-    """字段映射错了的话 ragas 会用空上下文去打分，而分数看起来只是「偏低」。"""
+    """字段映射错了的话 ragas 会用空上下文去打分，而分数看起来只是「偏低」。
+
+    ragas 是 `eval` extra，CI 不装。所以这条在 CI 上会跳过 —— 但**同文件里那些
+    不需要 ragas 的检查照跑**，因为 `eval.ragas_run` 的 ragas import 是懒的。
+    """
     samples = [
         {
             "question": "问",
@@ -192,6 +207,7 @@ def test_dataset_maps_the_ragas_fields():
     assert sample.retrieved_contexts == ["块1", "块2"]
 
 
+@requires_ragas
 def test_no_context_becomes_a_placeholder_not_an_empty_list():
     """一块都没检索到时也要给 ragas 一个非空列表。
 
@@ -210,6 +226,28 @@ def test_no_context_becomes_a_placeholder_not_an_empty_list():
 
     contexts = to_dataset(samples).samples[0].retrieved_contexts
     assert contexts and contexts != []
+
+
+def test_importing_the_eval_module_does_not_drag_in_ragas():
+    """ragas 的 import 必须是懒的。
+
+    放顶层的话，CI（只装 `.[dev]`）一 import 就炸 —— 而**这一天最重要的东西
+    （下面那道防呆、题库自检、采集器检查）根本不需要 ragas**。
+    依赖的重量不该拖累用不到它的测试。
+    """
+    import importlib
+    import sys
+
+    # 先把它从模块表里摘掉，再看重新 import 会不会把它带回来
+    for name in list(sys.modules):
+        if name == "ragas" or name.startswith("ragas."):
+            del sys.modules[name]
+
+    importlib.reload(importlib.import_module("eval.ragas_run"))
+
+    assert not any(n == "ragas" or n.startswith("ragas.") for n in sys.modules), (
+        "import eval.ragas_run 把 ragas 带进来了 —— CI 上会 ImportError"
+    )
 
 
 # --- 跑之前的防呆 -------------------------------------------------------

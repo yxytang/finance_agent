@@ -36,6 +36,8 @@ judge 撞上它的时候，那个空回复会被**当成一次低分**记进指�
 **不报的话，你不知道手里的分数有多少是服务端拦截的产物。**
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import sys
@@ -43,19 +45,29 @@ import time
 import warnings
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from langchain_openai import ChatOpenAI  # noqa: E402
-from ragas import evaluate  # noqa: E402
-from ragas.dataset_schema import EvaluationDataset, SingleTurnSample  # noqa: E402
-from ragas.llms import LangchainLLMWrapper  # noqa: E402
-from ragas.metrics import context_precision, context_recall, faithfulness  # noqa: E402
 
 from eval.collect import OUT  # noqa: E402
 from fa.config import build_model  # noqa: E402
+
+if TYPE_CHECKING:  # pragma: no cover
+    from ragas.dataset_schema import EvaluationDataset
+
+# **ragas 的 import 是懒的**，不放在模块顶层。
+#
+# CI 装的是 `.[dev]`，不含 `eval` 那个 extra（ragas 会带进 datasets / pyarrow /
+# scipy 两百多兆）。放在顶层的话，`tests/test_eval.py` 只要 import 这个模块就会
+# 失败 —— 而那一天最重要的东西（`sanity_problem` 防呆、题库自检、采集器检查）
+# **根本不需要 ragas**。
+#
+# 懒加载之后：CI 上照样能跑那些检查，只有真正用到 ragas 的两处会跳过。
+# 依赖的重量不该拖累用不到它的测试。
 
 FINDINGS = Path(__file__).resolve().parent.parent / "findings.md"
 MAX_ATTEMPTS = 3
@@ -129,7 +141,9 @@ def load_samples() -> list[dict]:
     return json.loads(OUT.read_text(encoding="utf-8"))
 
 
-def to_dataset(samples: list[dict]) -> EvaluationDataset:
+def to_dataset(samples: list[dict]) -> "EvaluationDataset":
+    from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
+
     return EvaluationDataset(
         samples=[
             SingleTurnSample(
@@ -176,6 +190,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  字段：{list(dataset.samples[0].model_fields)}")
         print(f"  平均检索块数：{sum(len(s['retrieved_contexts']) for s in samples) / len(samples):.1f}")
         return 0
+
+    from ragas import evaluate
+    from ragas.llms import LangchainLLMWrapper
+    from ragas.metrics import context_precision, context_recall, faithfulness
 
     judge = LangchainLLMWrapper(build_model(cls=RetryingChatModel))
     metric_objs = [faithfulness, context_precision, context_recall]
