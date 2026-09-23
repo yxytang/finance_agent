@@ -12,13 +12,15 @@
 因素列出来，而不是硬找一个工具去凑。
 """
 
+from functools import lru_cache
+
 from langchain_core.tools import BaseTool, tool
 
 from fa.retrieval import load_or_build, render, search
 from fa.tools._util import truncate
 
 # 一次返回多少个块。多了会把上下文塞满，而且后几名基本是噪音 ——
-# RRF 融合之后第 5 名往后分数掉得很快。
+# 融合之后第 5 名往后分数掉得很快。
 DEFAULT_TOP_K = 4
 
 
@@ -27,6 +29,29 @@ def _paths():
     from fa import config
 
     return config.KNOWLEDGE_DIR, config.KNOWLEDGE_INDEX
+
+
+@lru_cache(maxsize=1)
+def _vector_parts():
+    """向量那两件东西（embedder + 向量库）。没配就返回 `(None, None)`。
+
+    **进程内只开一次。** chromadb 的 PersistentClient 每次打开都要碰磁盘，而
+    `load_or_build` 是每检索一次就调一次的 —— 不缓存的话每次提问都重开一遍。
+
+    没配 `RAG_API_KEY` 时返回 `(None, None)`，于是 `load_or_build` 只走词法
+    两路，和加向量之前**逐字节一样**。这是降级路径，不是错误路径。
+
+    取舍和 `_util.load_bill` 的 `lru_cache` 一样：这份东西只读、进程内共享。
+    **测试要换语料目录的话，得先 `_vector_parts.cache_clear()`** —— 缓存住的
+    是「用哪个 key、开哪个库」，不含语料本身（那个每次重算指纹）。
+    """
+    from fa import config
+    from fa.retrieval.dense import HttpEmbedder, open_store
+
+    settings = config.rag_settings()
+    if settings is None:
+        return None, None
+    return HttpEmbedder(settings), open_store(config.CHROMA_DIR)
 
 
 def build_knowledge_tools() -> list[BaseTool]:
@@ -41,15 +66,22 @@ def build_knowledge_tools() -> list[BaseTool]:
         **什么时候不该用它**：问的是「我花了多少」「我有没有被多扣钱」——
         那些走 query_transactions / find_anomalies，答案得从账单里算出来。
 
-        query 写**关键词**还是写整句都行，但关键词通常更准：这个检索是纯词法的
-        （没有语义向量），换个说法就搜不到。搜「个税 专项附加扣除 房贷利息」
-        比搜「我想知道我这种情况能少交多少税」命中率高得多。
+        query 写**整句**还是压成关键词都行，不用特意改写。这个检索是混合的：
+        两路词法（标题 + 正文）加一路语义向量，再叠一层重排 —— 口语问法也
+        命中得了。
+
+        （第十一天量过：给这个检索加多查询改写、HyDE 之类的改写层，**一个字
+        都不变**。向量和重排已经把「换个说法」这个洞补上了，改写没有东西可修。
+        所以这里不劝你改写。）
 
         附带说明：知识库里的金额标准以**撰写时**的政策为准，回答时如果涉及
         具体数字，应该提醒用户以当年最新政策为准。
         """
         knowledge_dir, index_path = _paths()
-        index = load_or_build(knowledge_dir, index_path)
+        embedder, store = _vector_parts()
+        index = load_or_build(
+            knowledge_dir, index_path, embedder=embedder, store=store
+        )
 
         if not index.chunks:
             return (

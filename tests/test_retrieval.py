@@ -235,7 +235,16 @@ def test_fusion_score_depends_only_on_ranks():
 
 
 def test_a_hit_found_by_both_channels_outranks_one_found_by_one():
-    """两路都命中比只命中一路更可信 —— 这是融合真正在做的事。"""
+    """两路都命中比只命中一路更可信 —— 这是融合真正在做的事。
+
+    断言写的是**具体哪两路**，不是「两路」。加第三路向量那次（第十一天）刻意
+    选了后者会把这条测试留着不管的说法，但数数会放过一种情况：将来有人往
+    `search` 里塞了第四路、同时把某一路砍了，数量还是 2 而内容已经错了。
+    写死内容能逮住那个。
+
+    （这条还是「向量路缺席时行为不变」的哨兵：索引上没挂 `dense`，所以这里
+    永远只有标题和正文两路。真要挂了，这条会红。）
+    """
     index = SearchIndex().build(
         [
             Chunk("a.md", "a.md > 无关", "目标词在这里，但标题里没有。"),
@@ -245,7 +254,7 @@ def test_a_hit_found_by_both_channels_outranks_one_found_by_one():
     )
     hits = search(index, "目标词", top_k=2)
     assert hits[0].chunk.title == "目标词小节"
-    assert len(hits[0].channels) == 2
+    assert hits[0].channels == ("标题", "正文")
 
 
 def test_results_are_stable_across_runs(small_index):

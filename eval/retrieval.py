@@ -22,6 +22,7 @@
 「命中哪个小节」上有天然优势，而在「命中哪个文件」上两者可比。
 """
 
+import argparse
 import re
 import sys
 from dataclasses import dataclass
@@ -29,9 +30,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fa.config import KNOWLEDGE_DIR, KNOWLEDGE_INDEX  # noqa: E402
+from fa.config import CHROMA_DIR, KNOWLEDGE_DIR, KNOWLEDGE_INDEX, rag_settings  # noqa: E402
 from fa.retrieval import load_or_build, search  # noqa: E402
 from fa.retrieval.index import tokenize  # noqa: E402
+
+# 向量和重排那两件东西**在函数里 import**：`--mode bm25` 是 CI 走的路径，
+# 它不该顺带把 openai 客户端那套拉起来。chromadb 本来就在 dense.py 里是懒的，
+# 但让这个模块也只按需取，边界更清楚。
 
 
 @dataclass(frozen=True)
@@ -101,13 +106,94 @@ def rank_of(items: list[str], wanted: str) -> int | None:
     return None
 
 
-def run() -> int:
-    index = load_or_build(KNOWLEDGE_DIR, KNOWLEDGE_INDEX)
+def _build_index(mode: str):
+    """按模式建索引。**full 模式拒绝降级。**
+
+    `bm25` 模式是 CI 和快速迭代用的：确定、免费、秒级。
+    `full` 模式会调真的 embedding（要 key、要网络）。
+
+    ## 为什么 full 要当场验一次 embedding
+
+    因为**降级是静默的**。向量路挂了（账户欠费、key 失效、库坏了）时，
+    `hybrid._semantic_ranking` 会接住异常、退回两路 BM25，然后照常返回结果 ——
+    这是对的（不该让一次检索整个失败），但它意味着**一次失效的测量看起来和
+    正常测量一模一样**。
+
+    第十一天就踩到了：百炼账户欠费，embedding 和 rerank 全 400，脚本照样
+    打出一张表，而那张表全是 BM25 的数。差一点就当成「重排没用」报出去了。
+
+    所以这里直接打一发 embedding，让它在**测量开始之前**就抛出来。
+    """
+    if mode == "bm25":
+        return load_or_build(KNOWLEDGE_DIR, KNOWLEDGE_INDEX)
+
+    from fa.retrieval.dense import HttpEmbedder, open_store
+
+    settings = rag_settings()
+    if settings is None:
+        raise SystemExit(
+            "--mode full 要 RAG_API_KEY，但现在没配。\n"
+            "  要么填 .env，要么用 --mode bm25 —— 别在没开的时候声称是全开。"
+        )
+
+    embedder = HttpEmbedder(settings)
+    index = load_or_build(
+        KNOWLEDGE_DIR,
+        KNOWLEDGE_INDEX,
+        embedder=embedder,
+        store=open_store(CHROMA_DIR),
+    )
+    if index.dense is None or not index.dense.parents:
+        raise SystemExit("full 模式下向量路没挂上（库是空的？），不测了。")
+
+    embedder.embed(["健康检查"])  # 会抛就在这儿抛，别让它退化成 BM25
+    return index
+
+
+def _rank_of(hits, wanted: str) -> int | None:
+    for position, hit in enumerate(hits, start=1):
+        if hit.chunk.source == wanted:
+            return position
+    return None
+
+
+def run(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m eval.retrieval")
+    parser.add_argument(
+        "--mode",
+        choices=("bm25", "full"),
+        default="bm25",
+        help="bm25 = 只用词法两路（CI 用这个）；full = 加上向量",
+    )
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="再叠一层 cross-encoder 重排（只在 full 下有意义）",
+    )
+    args = parser.parse_args(argv)
+
+    if args.rerank and args.mode != "full":
+        raise SystemExit("--rerank 只在 --mode full 下有意义（它排的是融合后的候选）")
+
+    index = _build_index(args.mode)
     if not index.chunks:
         print(f"{KNOWLEDGE_DIR} 里没有语料。")
         return 1
 
-    print(f"语料：{len({c.source for c in index.chunks})} 篇，{len(index.chunks)} 个块\n")
+    reranker = None
+    candidates = 3
+    if args.rerank:
+        from fa.retrieval.rerank import RERANK_CANDIDATES, HttpReranker, rerank
+
+        reranker = HttpReranker(rag_settings())
+        candidates = RERANK_CANDIDATES
+
+    label = args.mode + ("+重排" if args.rerank else "")
+    print(f"语料：{len({c.source for c in index.chunks})} 篇，{len(index.chunks)} 个块")
+    print(f"模式：{label}")
+    if index.dense is not None:
+        print(f"      向量路子块 {len(index.dense.parents)} 个")
+    print()
 
     for name, cases in (("字面问法", LITERAL), ("换种说法", PARAPHRASED)):
         with_heading = [c for c in cases if c.heading]
@@ -116,10 +202,17 @@ def run() -> int:
         file_at_1 = 0
         head_at_1 = head_at_3 = 0
         base_at_1 = base_at_3 = 0
+        ranks: list[int] = []
         misses: list[str] = []
 
         for case in cases:
-            hits = search(index, case.question, top_k=3)
+            # 重排要的是**候选集**，不是最终的 3 条 —— 先截再排的话，被截掉的
+            # 那个正好常常是重排该救回来的。
+            hits = search(index, case.question, top_k=candidates)
+            if reranker is not None:
+                hits = rerank(case.question, hits, reranker=reranker)
+            hits = hits[:3]
+
             files = [h.chunk.source for h in hits]
             crumbs = [h.chunk.breadcrumb for h in hits]
 
@@ -127,6 +220,10 @@ def run() -> int:
                 file_at_1 += 1
             else:
                 misses.append(f"{case.question}  →  {files[0] if files else '（空）'}")
+
+            position = _rank_of(hits, case.source)
+            if position is not None:
+                ranks.append(position)
 
             if case.heading:
                 # breadcrumb 是「文件 > 一级标题 > 二级标题 …」，所以判「命中哪个
@@ -149,6 +246,11 @@ def run() -> int:
         if with_heading:
             line += f"   小节@1 {head_at_1}/{len(with_heading)}   小节@3 {head_at_3}/{len(with_heading)}"
         print(line)
+        # **平均排名和 @1 一样要报。** 第十一天重排把换说法的平均排名从 4.20
+        # 压到 2.20、字面的 @3/@5 提到 15/15，而 @1 一个都没动 —— 光看 @1
+        # 会把一个有效的改动读成无效的。
+        if ranks:
+            print(f"  期望文档的排名：命中 {len(ranks)}/{total}   平均 {sum(ranks)/len(ranks):.2f}")
         print(f"  朴素grep  文件@1 {base_at_1}/{total}   文件@3 {base_at_3}/{total}")
         if misses:
             print("  文件级没命中的：")
