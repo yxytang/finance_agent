@@ -41,17 +41,28 @@ def _vector_parts():
     没配 `RAG_API_KEY` 时返回 `(None, None)`，于是 `load_or_build` 只走词法
     两路，和加向量之前**逐字节一样**。这是降级路径，不是错误路径。
 
-    取舍和 `_util.load_bill` 的 `lru_cache` 一样：这份东西只读、进程内共享。
-    **测试要换语料目录的话，得先 `_vector_parts.cache_clear()`** —— 缓存住的
-    是「用哪个 key、开哪个库」，不含语料本身（那个每次重算指纹）。
+    embedder 外面包了一层缓存（`CachedEmbedder`）：语料改一个字节，原来 83 个
+    子块全部重打 embedding，现在只重打变的那几个。
+
+    **这里顺手打一行缓存后端。** 用一个 `lru_cache` 的函数做打印是有点怪的，
+    但这是「进程内只发生一次」的地方，而缓存退回了哪种后端**必须让人看见** ——
+    静默退回会让「我配了 Redis 怎么没快」变成一个查不出来的问题。
+    （同样的取舍见 `hybrid._semantic_ranking` 的只喊一次。）
+
+    权衡和 `_util.load_bill` 一样：这份东西只读、进程内共享。
+    **测试要换语料目录的话，得先 `_vector_parts.cache_clear()`**。
     """
     from fa import config
+    from fa.retrieval.cache import CachedEmbedder, open_cache
     from fa.retrieval.dense import HttpEmbedder, open_store
 
     settings = config.rag_settings()
     if settings is None:
         return None, None
-    return HttpEmbedder(settings), open_store(config.CHROMA_DIR)
+
+    cache = open_cache()
+    print(f"检索缓存：{cache.describe()}")
+    return CachedEmbedder(HttpEmbedder(settings), cache), open_store(config.CHROMA_DIR)
 
 
 def build_knowledge_tools() -> list[BaseTool]:

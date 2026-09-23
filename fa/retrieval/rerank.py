@@ -46,6 +46,9 @@ _rerank_warned = False
 
 
 class Reranker(Protocol):
+    # 缓存键要用它（见 cache.py）—— 换模型必须换键，否则旧分数会被喂回来。
+    model_id: str
+
     def scores(self, query: str, documents: list[str]) -> list[float | None]:
         """给每个文档打分，顺序和输入一一对应。判不了分的给 None。"""
         ...
@@ -63,8 +66,8 @@ class HttpReranker:
 
     def __init__(self, settings: RagSettings):
         self._url = settings.rerank_base_url
-        self._model = settings.rerank_model
         self._key = settings.api_key
+        self.model_id = settings.rerank_model
 
     def scores(self, query: str, documents: list[str]) -> list[float | None]:
         import httpx
@@ -76,7 +79,7 @@ class HttpReranker:
                 "Content-Type": "application/json",
             },
             json={
-                "model": self._model,
+                "model": self.model_id,
                 "input": {"query": query, "documents": documents},
                 "parameters": {
                     "return_documents": False,

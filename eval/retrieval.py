@@ -127,6 +127,7 @@ def _build_index(mode: str):
     if mode == "bm25":
         return load_or_build(KNOWLEDGE_DIR, KNOWLEDGE_INDEX)
 
+    from fa.retrieval.cache import CachedEmbedder, open_cache
     from fa.retrieval.dense import HttpEmbedder, open_store
 
     settings = rag_settings()
@@ -136,7 +137,9 @@ def _build_index(mode: str):
             "  要么填 .env，要么用 --mode bm25 —— 别在没开的时候声称是全开。"
         )
 
-    embedder = HttpEmbedder(settings)
+    cache = open_cache()
+    print(f"检索缓存：{cache.describe()}")
+    embedder = CachedEmbedder(HttpEmbedder(settings), cache)
     index = load_or_build(
         KNOWLEDGE_DIR,
         KNOWLEDGE_INDEX,
@@ -183,9 +186,10 @@ def run(argv: list[str] | None = None) -> int:
     reranker = None
     candidates = 3
     if args.rerank:
+        from fa.retrieval.cache import CachedReranker, open_cache
         from fa.retrieval.rerank import RERANK_CANDIDATES, HttpReranker, rerank
 
-        reranker = HttpReranker(rag_settings())
+        reranker = CachedReranker(HttpReranker(rag_settings()), open_cache())
         candidates = RERANK_CANDIDATES
 
     label = args.mode + ("+重排" if args.rerank else "")

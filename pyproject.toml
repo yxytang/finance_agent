@@ -57,6 +57,20 @@ web = [
 rag = [
     "chromadb",
 ]
+# 检索结果缓存（embedding + rerank 两层）。单独列，理由和上面两个一样。
+#
+# **不装也能跑** —— 没装 redis 客户端时退回进程内的 dict 缓存，那在单进程里
+# 已经够用。所以这个 extra 带来的只是「跨进程共享」那一件事，
+# 不该让不需要它的人付安装成本。
+#
+# `fakeredis` 也在里面：它是纯 Python 的 Redis 实现，**同一套客户端 API**，
+# 用来在没有服务端的机器上验客户端代码。CI 装 `.[dev]`，所以那几条测试会跳过
+# —— 缓存**逻辑**由 `MemoryCache` 覆盖（那个不需要任何依赖），Redis 只覆盖
+# 往返那一条。
+cache = [
+    "redis",
+    "fakeredis",
+]
 dev = ["pytest"]
 
 [tool.pytest.ini_options]
