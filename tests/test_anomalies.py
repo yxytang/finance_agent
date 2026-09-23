@@ -54,8 +54,19 @@ def categorized():
 
     异常检测的按类目分组需要类目，而 categories 本来要第四天才有 ——
     这里直接拿 reference 当答案贴上，测的是检测器不是分类器。
+
+    **结束日钉死在 2026-08-31。** 账单默认跟着今天走（见 data/generate.py），
+    而下面几条断言写的是**具体数字**：READLY 扣了 12 次、年化 119.88。不钉的话
+    这份 fixture 会随运行日期漂移 —— READLY 锚在每月 23 号，今天一过 23 号就多
+    一次扣款，`occurrences == 12` 当场变 13，而 23 号之前它又是绿的。
+
+    **一个只在每月后半月才红的测试，比一个一直红的更糟**：它会在某天毫无征兆地
+    出现、改完又「自己好了」。它 2026-09-23 就是这么红的（前一天还是绿的）。
+
+    钉住的是**输入数据**，不是被测的行为；要测「账单不完整时检测器怎么办」，
+    用 `end=` 单造一份，别动这份。
     """
-    transactions, reference = build()
+    transactions, reference = build(end=date(2026, 8, 31))
     return [t.with_category(reference[t.txn_id]) for t in transactions]
 
 
