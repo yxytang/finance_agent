@@ -1767,3 +1767,29 @@ TTL 在这里管的是**内存**，不是正确性：键永远不会「过期变
 
 `MEMORY USAGE` 在 fakeredis 上没实现（真 Redis 有）。这不是我们的 bug，
 但值得知道 —— **替身不是服务端**，有些命令和边界它不覆盖。
+
+### 环境上的一件事：WSL2 会把 VM 收掉，Redis 跟着没
+
+装了 Redis（WSL 里 `apt install redis-server`）之后遇到一个反复出现的问题：
+**上一条 `wsl` 命令结束不久，VM 就被回收，Redis 连不上了。**
+
+表现很有迷惑性 —— 它**不是一直连不上**：
+
+- 刚 ping 通过，隔一会儿再连就是 `ConnectionRefused`
+- 更麻烦的是**跑到一半断**：一次 80 秒的评测里连接被掐，`redis.exceptions.ConnectionError`
+
+两次踩到，第一次我还以为是网络问题。看清了才明白是 WSL 的 VM 生命周期。
+
+**保活的办法：一条常驻命令顶着**（比每 5 秒 poll 一次干净得多）
+
+    wsl -d Ubuntu -u root -- sleep 3600
+
+**顺带发现 Redis 默认不保证不丢**：VM 被硬收掉时来不及存 RDB，下次起来是空的
+（`used_memory_peak` 一直等于基线，说明这个实例从没存过东西 —— 这就是线索）。
+
+对**缓存**来说这不是问题：键是内容派生的，丢了重算就是了，而重算出来的值一样。
+**但这恰恰说明了「本地开发跑个 Redis」和「生产用 Redis」是两回事** ——
+可用性和持久性的性质都不一样，别把本地那套当结论。
+
+（还有个更省事的修法没试：`.wslconfig` 里 `networkingMode=mirrored`。
+它顺带能解决 WSL 一直提示的那个「localhost 代理未镜像」警告。）

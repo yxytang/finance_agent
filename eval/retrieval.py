@@ -107,10 +107,14 @@ def rank_of(items: list[str], wanted: str) -> int | None:
 
 
 def _build_index(mode: str):
-    """按模式建索引。**full 模式拒绝降级。**
+    """按模式建索引。**full 模式拒绝降级。** 返回 `(索引, 缓存)`。
 
-    `bm25` 模式是 CI 和快速迭代用的：确定、免费、秒级。
-    `full` 模式会调真的 embedding（要 key、要网络）。
+    `bm25` 模式是 CI 和快速迭代用的：确定、免费、秒级。它不需要缓存，
+    所以缓存那一路返回 None。
+
+    `full` 模式会调真的 embedding（要 key、要网络），并且**缓存开一次共用**——
+    以前这里和重排那处各开了一次，于是两个独立的缓存对象、两条重复的
+    「连不上」警告。
 
     ## 为什么 full 要当场验一次 embedding
 
@@ -125,7 +129,7 @@ def _build_index(mode: str):
     所以这里直接打一发 embedding，让它在**测量开始之前**就抛出来。
     """
     if mode == "bm25":
-        return load_or_build(KNOWLEDGE_DIR, KNOWLEDGE_INDEX)
+        return load_or_build(KNOWLEDGE_DIR, KNOWLEDGE_INDEX), None
 
     from fa.retrieval.cache import CachedEmbedder, open_cache
     from fa.retrieval.dense import HttpEmbedder, open_store
@@ -150,7 +154,7 @@ def _build_index(mode: str):
         raise SystemExit("full 模式下向量路没挂上（库是空的？），不测了。")
 
     embedder.embed(["健康检查"])  # 会抛就在这儿抛，别让它退化成 BM25
-    return index
+    return index, cache
 
 
 def _rank_of(hits, wanted: str) -> int | None:
@@ -178,7 +182,7 @@ def run(argv: list[str] | None = None) -> int:
     if args.rerank and args.mode != "full":
         raise SystemExit("--rerank 只在 --mode full 下有意义（它排的是融合后的候选）")
 
-    index = _build_index(args.mode)
+    index, cache = _build_index(args.mode)
     if not index.chunks:
         print(f"{KNOWLEDGE_DIR} 里没有语料。")
         return 1
@@ -186,10 +190,11 @@ def run(argv: list[str] | None = None) -> int:
     reranker = None
     candidates = 3
     if args.rerank:
-        from fa.retrieval.cache import CachedReranker, open_cache
+        from fa.retrieval.cache import CachedReranker
         from fa.retrieval.rerank import RERANK_CANDIDATES, HttpReranker, rerank
 
-        reranker = CachedReranker(HttpReranker(rag_settings()), open_cache())
+        # 和 embedding 用**同一个**缓存对象，别再开一个。
+        reranker = CachedReranker(HttpReranker(rag_settings()), cache)
         candidates = RERANK_CANDIDATES
 
     label = args.mode + ("+重排" if args.rerank else "")
