@@ -20,14 +20,21 @@
 
 ## 已知的短板
 
-两路都是词法的，所以**换个说法就搜不到**：用户问「怎么少交点税」，文档里写的
-是「专项附加扣除」「起征点」，字面上一个都对不上。
+两路 BM25 都是词法的，所以**换个说法就搜不到**：用户问「怎么少交点税」，文档里
+写的是「专项附加扣除」「起征点」，字面上一个都对不上。
 
-这是纯词法检索的固有代价（DeepSeek 没有 embedding 接口），不打算藏 ——
-第八天的 RAGAS `context_recall` 就是它的实测分数。到时候如果这个短板明显，
-再考虑加一层同义词扩展，用数字决定要不要加，而不是先加上再说。
+**第十一天加了第三路向量**（`"语义"`）来补这个洞。它的开关是
+`SearchIndex.dense` —— 索引带了向量库它才参与，不带就还是原来那两路，行为和
+加它之前逐字节一样。实测（Stage 0 探针）：换说法那 5 题 file@1 从 **1/5 到
+4/5**，字面那 15 题没掉。
+
+⚠️ **但向量路不是「白加的一路」。** RRF 里一个三路都命中的块拿 `3/(60+rank)`，
+两路命中的拿 `2/(60+rank)`，所以向量能**重排**字面组 —— 而字面组原来是
+14/15。下面的 `-len(h.channels)` 兜底也开始偏好三路命中。这是真实的杠杆，
+`eval/retrieval.py` 的字面那一行要盯着。
 """
 
+import sys
 from dataclasses import dataclass
 
 from fa.retrieval.chunk import Chunk
@@ -38,6 +45,34 @@ RRF_K = 60
 # 每一路先各取前多少个候选再融合。取太少会漏掉「正文排第 30 但标题排第 1」
 # 这种块 —— 而它恰恰是标题那一路存在的意义。
 PER_CHANNEL = 30
+
+# 向量那一路在模型眼里的名字。和「标题」「正文」并列，所以措辞要一致。
+SEMANTIC = "语义"
+
+# 向量失败只喊一次。每一句查询都喊一遍会把 stderr 刷满，而用户看到的信息
+# 并不比第一次多。（同样的取舍见 fa/agent.py 里事件监听器抛异常那段。）
+_dense_warned = False
+
+
+def _semantic_ranking(index: SearchIndex, query: str, k: int) -> list[int]:
+    """向量那一路的排名。**失败就返回空，绝不抛。**
+
+    向量是加强项。它挂了 —— 网络不通、key 失效、向量库坏了 —— 正确的反应是
+    退回两路 BM25，而不是让整个检索失败。用户拿不到任何结果，比拿到一个没有
+    向量加持的结果糟得多。
+
+    返回空就等于这一路不贡献任何分数（RRF 是加法的）。这也是
+    `test_fusion_score_depends_only_on_ranks` 在裸索引上仍然等于 `2/(RRF_K+1)`
+    的原因。
+    """
+    global _dense_warned
+    try:
+        return index.dense.search(query, k)
+    except Exception as exc:  # noqa: BLE001 - 观察者不该把被观察者弄坏
+        if not _dense_warned:
+            _dense_warned = True
+            print(f"⚠️ 向量检索失败，这一轮退回纯 BM25：{exc}", file=sys.stderr)
+        return []
 
 
 @dataclass(frozen=True)
@@ -56,25 +91,38 @@ class Hit:
 def search(
     index: SearchIndex, query: str, *, top_k: int = 5, per_channel: int = PER_CHANNEL
 ) -> list[Hit]:
-    """两路检索 + RRF 融合。索引为空时返回空列表，不报错。"""
+    """多路检索 + RRF 融合。索引为空时返回空列表，不报错。
+
+    **向量那一路只在 `index.dense` 存在时才跑。** 这个函数不读环境变量、不看
+    配置、不问任何全局状态 —— 它只认索引上挂了什么。理由见
+    `SearchIndex.dense` 上那段：否则同一条测试会在 CI 上绿、在开发机上红。
+    """
     if not index.chunks or not query.strip():
         return []
 
     fused: dict[int, float] = {}
     channels: dict[int, list[str]] = {}
 
-    for name, label in (("title", "标题"), ("body", "正文")):
-        ranked = index.rank(name, query)[:per_channel]
-        for rank, (doc_id, _score) in enumerate(ranked, start=1):
+    def rank_in(doc_ids, label: str) -> None:
+        for rank, doc_id in enumerate(doc_ids, start=1):
             fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (RRF_K + rank)
             channels.setdefault(doc_id, []).append(label)
+
+    for name, label in (("title", "标题"), ("body", "正文")):
+        rank_in((doc_id for doc_id, _ in index.rank(name, query)[:per_channel]), label)
+
+    if index.dense is not None:
+        rank_in(_semantic_ranking(index, query, per_channel), SEMANTIC)
 
     hits = [
         Hit(chunk=index.chunks[doc_id], score=score, channels=tuple(channels[doc_id]))
         for doc_id, score in fused.items()
     ]
-    # 同分时按「两路都命中」优先，再按原文顺序 —— 保证结果稳定，
+    # 同分时按「几路都命中」优先，再按原文顺序 —— 保证结果稳定，
     # 否则同一句话问两次可能拿到不同的块。
+    #
+    # 注意 `-len(h.channels)` 在加了第三路之后**也开始偏好三路命中的块**。
+    # 这是真实的杠杆，不是中性的加法：见 Stage 8 要盯的「字面组有没有被拖低」。
     hits.sort(key=lambda h: (-h.score, -len(h.channels), h.chunk.source))
     return hits[:top_k]
 

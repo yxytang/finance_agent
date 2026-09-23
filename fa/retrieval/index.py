@@ -1,7 +1,12 @@
-"""BM25 检索 —— 纯词法，因为 DeepSeek 没有 embedding 接口（查证过）。
+"""BM25 检索 —— 两路词法。
 
-这个限制不藏着：它意味着**换一种说法就搜不到**。第八天的 RAGAS
-`context_recall` 分数就是它的实测代价，而不是找个好看的数字遮过去。
+这个模块**只做词法**，而且第十一天加向量那件事**一行都没改它**。这是有意的：
+它决定了 BM25 每一路的名次，动它一下 `corpus_fingerprint` 就变、整个索引重建、
+**基线数字整体位移** —— 而那次改动的全部意义就是「加了向量之后数字怎么变」，
+基线一动就没法归因了。向量那一路在 `dense.py`，融合在 `hybrid.py`。
+
+纯词法的代价是实测过的：换一种说法就搜不到。`eval/retrieval.py` 的转述组
+file@1 只有 **1/5**（补上向量 + 重排之后是 3/5，平均排名从 5.60 到 2.20）。
 
 ## 中文没有空格，所以先得解决「什么是词」
 
@@ -30,8 +35,13 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from fa.retrieval.chunk import Chunk, load_corpus
+
+if TYPE_CHECKING:
+    # 只在类型检查时 import，避免 index ←→ dense 的运行时耦合。
+    from fa.retrieval.dense import DenseIndex
 
 # CJK 统一表意文字 + 扩展 A + 兼容区
 _CJK = re.compile(r"[㐀-䶿一-鿿豈-﫿]")
@@ -186,6 +196,19 @@ class SearchIndex:
     # 建索引时语料的指纹，用来判断索引过期没有 —— 见 load_or_build。
     fingerprint: str = ""
 
+    # 向量路。**None 就是没有**，而这是它唯一的开关。
+    #
+    # 这一点是刻意的，不是随手写的：如果 `hybrid.search` 改成去读环境变量或者
+    # 一个模块级单例来判定「有没有向量路」，那么
+    # `test_a_hit_found_by_both_channels_outranks_one_found_by_one`（断言
+    # `len(channels) == 2`）就会**在 CI 上绿、在配了 key 的开发机上红** ——
+    # 环境相关的静默失败，正是这个仓库的测试存在的理由。
+    #
+    # 所以：**向量参不参与，是索引的属性，不是环境的属性。** `search()` 保持是
+    # `(index, query)` 的纯函数。`save`/`load` 都不碰这个字段（payload 是显式
+    # 列出来的），由 `load_or_build` 挂上。
+    dense: "DenseIndex | None" = None
+
     def build(self, chunks: list[Chunk], fingerprint: str = "") -> "SearchIndex":
         self.chunks = list(chunks)
         self.title = _Field()
@@ -285,19 +308,41 @@ def corpus_fingerprint(root: Path) -> str:
     return digest.hexdigest()
 
 
-def load_or_build(root: Path, path: Path) -> SearchIndex:
+def load_or_build(
+    root: Path, path: Path, *, embedder=None, store=None
+) -> SearchIndex:
     """有新鲜的索引就用它，否则重建并存下来。
 
     这是检索层的唯一入口 —— 别的地方不该直接调 load 或 save，
     否则「什么时候该重建」这件事就会散成好几处，然后有一处忘了。
+
+    `embedder` / `store` 都不给时，行为和以前**逐字节一样**（CI 和绝大多数测试
+    走的是这条）。两个都给才挂向量路 —— 而且**是 `search` 之外唯一决定向量
+    参不参与的地方**，见 `SearchIndex.dense` 上那段。
     """
     current = corpus_fingerprint(root)
     cached = load(path)
 
     if cached.chunks and cached.fingerprint == current:
-        return cached
+        index = cached
+    else:
+        index = SearchIndex().build(load_corpus(root), fingerprint=current)
+        if index.chunks:
+            save(index, path)
 
-    index = SearchIndex().build(load_corpus(root), fingerprint=current)
-    if index.chunks:
-        save(index, path)
+    # **两条分支都要挂。** `load()` 是显式构造 `SearchIndex(chunks=...,
+    # fingerprint=...)` 的，不认识 dense 这个字段 —— 只在重建那条分支挂的话，
+    # 向量路会用一次，然后从第二次调用起**静默消失**，之后每次检索都悄悄退回
+    # BM25，而没有任何报错。
+    if embedder is not None and store is not None and index.chunks:
+        # 局部 import：让检索核心（这个模块）在 import 期不依赖 config /
+        # langchain。类型那边用 TYPE_CHECKING，运行时这里按需取。
+        from fa.retrieval.dense import dense_fingerprint, load_dense
+
+        index.dense = load_dense(
+            index.chunks,
+            embedder=embedder,
+            store=store,
+            fingerprint=dense_fingerprint(current, embedder.model_id),
+        )
     return index
