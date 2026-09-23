@@ -42,6 +42,21 @@ web = [
     "fastapi",
     "uvicorn",
 ]
+# 第十一天的向量检索单独列 —— **chromadb 不能进 base `dependencies`。**
+#
+# CI 装的是 `.[dev]`，而它会连带装 base。一条 base 依赖就会把 chromadb 拖进
+# 每一次 CI 运行，为了一个 CI 根本走不到的代码路径：向量检索要 API key 和网络，
+# 而 CI 两样都没有（ci.yml 里写明了测试全部离线、LLM 调用全部打桩）。
+# 第九天已经吃过一次同类的亏 —— ragas 顺着 import 链被拖进测试，200 多兆。
+#
+# 而且 Windows 上装 chromadb 有可能失败，CI 是 Ubuntu，抓不到那种问题。
+# 待在 extra 里，装不上的人只是没有向量检索，程序照常跑。
+#
+# 它只列一个依赖是有意的：embedding 和重排都走 HTTP，客户端复用已经装了的
+# `openai` / `httpx`；向量库以外的东西（递归切分、余弦、RRF）全是标准库。
+rag = [
+    "chromadb",
+]
 dev = ["pytest"]
 
 [tool.pytest.ini_options]

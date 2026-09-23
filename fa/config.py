@@ -6,6 +6,7 @@
 """
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,6 +24,10 @@ KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge"
 # 检索索引的落盘位置。放在 knowledge/.index/ 而不是 data/：它和语料是一体的，
 # 语料换地方了索引也该跟着走。已在 .gitignore 里 —— 它是产物，能重建。
 KNOWLEDGE_INDEX = KNOWLEDGE_DIR / ".index" / "index.json"
+# 向量库的落盘位置。和 index.json 同一个目录，理由也一样：它是**这份语料的**
+# 索引，不是一份独立的数据。已经在 .gitignore 里（`knowledge/.index/` 整条），
+# 因为它同样是产物、能重建。
+CHROMA_DIR = KNOWLEDGE_DIR / ".index" / "chroma"
 MEMORY_DIR = PROJECT_ROOT / "memory"
 
 TRANSACTIONS_CSV = DATA_DIR / "transactions.csv"
@@ -109,4 +114,73 @@ def build_model(cls=ChatOpenAI, **kwargs) -> ChatOpenAI:
         temperature=0,
         timeout=REQUEST_TIMEOUT,
         **kwargs,
+    )
+
+
+# embedding 走 OpenAI 兼容接口，默认阿里云百炼（DashScope）。
+DEFAULT_EMBED_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_EMBED_MODEL = "text-embedding-v4"
+
+# 重排。**端点和 embedding 不是同一个** —— embedding 是 OpenAI 兼容形状，重排是
+# 百炼自己那套（`input` / `parameters` 包一层，回 `output.results`）。
+#
+# 这两个值是**实测过的**，不是照文档抄的（2026-09-23：拿真 key 打了一次，
+# 200，`relevance_score` 把正确答案打在 0.174、其余两篇 0.006）。留空就关掉重排。
+DEFAULT_RERANK_BASE_URL = (
+    "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
+)
+DEFAULT_RERANK_MODEL = "gte-rerank-v2"
+
+
+@dataclass(frozen=True)
+class RagSettings:
+    """向量检索要的配置。
+
+    embedding 和 rerank **分开配**，理由见上面那两段。
+    """
+
+    api_key: str
+    embed_base_url: str
+    embed_model: str
+    rerank_base_url: str
+    rerank_model: str
+
+    @property
+    def rerank_enabled(self) -> bool:
+        """URL 和模型都填了才算启用重排。
+
+        想关掉重排就把这两个变量之一置空（`RAG_RERANK_MODEL=`）。缺一个就退回
+        融合顺序（降级，不是报错）—— 重排是锦上添花，配不全不该让检索整个
+        不可用。
+        """
+        return bool(self.rerank_base_url and self.rerank_model)
+
+
+def rag_settings() -> RagSettings | None:
+    """读向量检索的配置。**没配就返回 None，不报错。**
+
+    这里**故意**和 `build_model()` 反着来。那个缺 key 必须当场报，因为没有模型
+    整个 agent 一个字都答不出来；而向量检索是**加强项** —— 缺了它退回纯 BM25
+    （也就是这个功能加进来之前的行为），agent 照常跑。
+
+    把这里也做成报错，等于让一个可选功能把整个程序拦下来，而且是在一个用户
+    根本没要求过它的场景里。所以「没配」是一个**正常返回值**，不是异常。
+
+    后面 `if not settings` 的人要自己决定怎么处理：检索层是降级，而
+    `--mode full` 那种「用户明说要全开」的入口应该自己报错。
+    """
+    api_key = os.environ.get("RAG_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    return RagSettings(
+        api_key=api_key,
+        embed_base_url=os.environ.get(
+            "RAG_EMBED_BASE_URL", DEFAULT_EMBED_BASE_URL
+        ).strip(),
+        embed_model=os.environ.get("RAG_EMBED_MODEL", DEFAULT_EMBED_MODEL).strip(),
+        rerank_base_url=os.environ.get(
+            "RAG_RERANK_BASE_URL", DEFAULT_RERANK_BASE_URL
+        ).strip(),
+        rerank_model=os.environ.get("RAG_RERANK_MODEL", DEFAULT_RERANK_MODEL).strip(),
     )
