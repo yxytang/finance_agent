@@ -218,6 +218,22 @@ def stop_turn(session_id: str, request: Request) -> dict:
     return {"accepted": True, "stopping": True}
 
 
+@app.delete("/api/sessions/{session_id}")
+def close_session(session_id: str, request: Request) -> dict:
+    """关掉一个会话 —— 连同它的历史一起。
+
+    **这是真的会丢东西的**（对话只在内存里），所以前端有内容的会话会先问一句。
+    接口本身不拦：反复关同一个会话，第二次给 404，对用户来说不是失败。
+
+    正在跑的话先停掉再摘（见 `SessionManager.close` 的说明）。
+    """
+    _check(request)
+    if manager.get(session_id) is None:
+        raise HTTPException(status_code=404, detail="没有这个会话")
+
+    return {"closed": True, "was_running": manager.close(session_id)}
+
+
 @app.post("/api/sessions/{session_id}/chart")
 def chart(session_id: str, payload: dict) -> dict:
     """把一段工具结果转成图表数据。

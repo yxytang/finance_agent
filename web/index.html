@@ -44,14 +44,25 @@
   .side-head button { margin-left: auto; padding: 2px 10px; }
   #sessions { flex: 1; overflow-y: auto; padding: 6px; }
   .session {
-    display: block; width: 100%; text-align: left; margin-bottom: 3px;
-    background: none; border: 1px solid transparent; border-radius: 6px;
-    padding: 6px 9px; cursor: pointer; font-size: 13px;
+    display: flex; align-items: center; margin-bottom: 3px; font-size: 13px;
+    border: 1px solid transparent; border-radius: 6px;
   }
   .session:hover { background: #232833; }
   .session.active { background: #22303f; border-color: #3c5f85; }
+  .session .pick {
+    flex: 1; min-width: 0; text-align: left; cursor: pointer;
+    background: none; border: 0; color: inherit; font: inherit; padding: 6px 2px 6px 9px;
+  }
   .session .sid { display: block; font-family: ui-monospace, Consolas, monospace; }
   .session .meta { display: block; color: var(--dim); font-size: 11px; margin-top: 1px; }
+  /* 关掉这一行。**一直显示，不做成 hover 才出现** —— 触屏没有 hover，
+     藏起来就等于按不到。 */
+  .session .kill {
+    flex: none; cursor: pointer; background: none; border: 0; color: var(--dim);
+    font-size: 15px; line-height: 1; padding: 4px 8px; border-radius: 4px;
+  }
+  .session .kill:hover { color: var(--bad); background: #2a1f22; }
+  .session .kill:disabled { opacity: .35; cursor: default; background: none; }
   .pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   header {
     display: flex; align-items: center; gap: 12px;
@@ -206,9 +217,11 @@ let sessions = [];    // 服务端认得的会话，最近活动的在前
 
 // --- 工具 ---------------------------------------------------------------
 
-async function api(path, body) {
+// 第三个数只在 DELETE 这种「没有 body 但要非 POST 动作」的地方才用得上。
+// 不给就照旧：有 body 是 POST，没 body 是 GET。
+async function api(path, body, method) {
   const res = await fetch(path, {
-    method: body === undefined ? "GET" : "POST",
+    method: method || (body === undefined ? "GET" : "POST"),
     headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -268,7 +281,9 @@ function recall() {
 
 function openSession(id) {
   if (source) source.close();
+  source = null;
   log.innerHTML = "";
+  toolCards = {};      // 见 `toolCards` 的说明：换会话就是换一份渲染状态
   current = null;
   setBusy(false);
   remember(id);
@@ -299,15 +314,68 @@ function renderList() {
   const box = $("sessions");
   box.innerHTML = "";
   for (const item of sessions) {
-    const node = el("button", "session" + (item.id === sessionId ? " active" : ""));
-    node.appendChild(el("span", "sid", item.id.slice(0, 8)));
-    node.appendChild(
+    // 一行两件事：点开它、或者关掉它。所以是**两个**按钮而不是一个 ——
+    // 按钮里嵌按钮是非法 HTML，浏览器会把标签拆开，然后点击行为变得莫名其妙。
+    const row = el("div", "session" + (item.id === sessionId ? " active" : ""));
+
+    const pick = el("button", "pick");
+    pick.appendChild(el("span", "sid", item.id.slice(0, 8)));
+    pick.appendChild(
       el("span", "meta",
          item.turns + " 轮 · " + (item.busy ? "进行中" : when(item.last_activity)))
     );
-    node.onclick = () => openSession(item.id);
-    box.appendChild(node);
+    pick.onclick = () => openSession(item.id);
+
+    const kill = el("button", "kill", "×");
+    kill.title = "关掉这个会话";
+    kill.onclick = () => closeSession(item.id, kill);
+
+    row.appendChild(pick);
+    row.appendChild(kill);
+    box.appendChild(row);
   }
+}
+
+async function closeSession(id, button) {
+  const item = sessions.find((s) => s.id === id);
+
+  // **有内容的才问一句。** 空的关掉是零成本的，每关一个都弹窗就成了噪音。
+  // 而问的那些是真的会没的：对话只存在内存里，关掉不留下任何东西。
+  if (item && item.turns > 0 &&
+      !window.confirm(`关掉这个会话？${item.turns} 轮对话不会留下。`)) {
+    return;
+  }
+
+  button.disabled = true;
+  try {
+    await api(`/api/sessions/${id}`, undefined, "DELETE");
+  } catch (err) {
+    // 已经不在了（多半是重复点击）—— 对用户来说不是失败，下面那次
+    // refreshList 会把界面扶正。
+    console.warn("关会话失败", err);
+  }
+
+  if (id !== sessionId) {
+    await refreshList();
+    return;
+  }
+
+  // **关的是当前这个，得先离开它再刷新列表。** 顺序反了会出现一瞬间「界面还
+  // 连着一个服务端已经没有的会话」，而 EventSource 会对着它一直重连 ——
+  // 看起来就是卡住了。
+  if (source) source.close();
+  source = null;
+  sessionId = null;
+  log.innerHTML = "";
+  current = null;
+  toolCards = {};      // 换会话就是换一份渲染状态，见 `toolCards` 的说明
+  setBusy(false);
+
+  await refreshList();
+  const next = sessions[0];
+  // 一个都不剩就开一个 —— 否则界面没有任何会话可用，而「＋」不一定找得到。
+  if (next) openSession(next.id);
+  else await newSession();
 }
 
 async function newSession() {
@@ -424,7 +492,12 @@ function render(ev) {
 }
 
 // 工具卡片按 call_id 索引，这样结果回来时能找到发起它的那一行。
-const toolCards = {};
+//
+// **换会话要清空它**（见 `openSession`）。不清的话两件事：条目只增不减，
+// 是个泄漏；更要紧的是里面的 DOM 节点在 `log.innerHTML = ""` 之后已经脱离
+// 文档了 —— 万一有个 id 对得上，`fillTool` / `addChart` 会把结果追加到一个
+// 看不见的节点上，输出**静默消失**。
+let toolCards = {};
 
 function addTool(ev) {
   const card = el("div", "tool");

@@ -533,6 +533,63 @@ def test_stopping_a_busy_session_reaches_the_agent():
     assert live.session._stop.is_set()
 
 
+# --- 关掉会话 -----------------------------------------------------------
+#
+# 关掉是**真会丢东西的**：对话只在内存里，没有任何持久化。所以这一组测试关心的
+# 是「关掉的时候有没有把该做的做完」，而不是「关掉快不快」。
+
+
+def test_closing_a_session_removes_it_from_the_list():
+    manager = SessionManager(confirm=False)
+    doomed = manager.create()
+    kept = manager.create()
+
+    manager.close(doomed.id)
+
+    assert {item.id for item in manager.list()} == {kept.id}
+    assert manager.get(doomed.id) is None
+
+
+def test_closing_a_running_session_stops_it_first():
+    """**先停再摘。**
+
+    不先停的话，那一轮会**没人看着继续跑完** —— 每次工具调用和每次模型往返都是
+    真调用，而结果发进一个已经没有订阅者的对象。用户以为关掉就没了，账单上却在
+    继续花钱。
+
+    返回值是「当时在跑」，给界面用：关掉一个进行中的会话和关掉一个闲置的，
+    对用户不是同一件事。
+    """
+    manager = SessionManager(confirm=False)
+    live = manager.create()
+    live.busy = True
+
+    assert manager.close(live.id) is True
+    assert live.session._stop.is_set()   # 停止信号真的发到了 agent 那边
+    assert manager.get(live.id) is None  # 而且确实摘掉了
+
+
+def test_closing_an_idle_session_reports_it_was_idle():
+    manager = SessionManager(confirm=False)
+    live = manager.create()
+
+    assert manager.close(live.id) is False
+
+
+def test_closing_the_same_session_twice_is_not_an_error():
+    """浏览器点两下、或者两个标签页各点一下，都会走到这儿。
+
+    第二次给 404，对用户来说不是失败 —— 他要的结果（这个会话没了）已经在了。
+    """
+    manager = SessionManager(confirm=False)
+    live = manager.create()
+
+    manager.close(live.id)
+
+    assert manager.close(live.id) is False   # 第二次：已经不在了
+    assert manager.get(live.id) is None
+
+
 # --- 前端渲染 -----------------------------------------------------------
 #
 # 前端在此之前完全没有测试。这条是第一个，它有具体的由来：`markdown()` 里刚发现
@@ -603,6 +660,72 @@ if (code.includes('<ul>') || code.includes('<blockquote>')) {
 
     result = subprocess.run(
         ["node", "-e", _markdown_source() + checks],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="没有 node，跑不了前端脚本")
+def test_session_row_has_two_separate_buttons():
+    """侧栏一行要能**点开**，也要能**关掉** —— 所以是两个并排的按钮。
+
+    可能会写成「一个按钮，里面再放一个 ×」。**按钮里嵌按钮是非法 HTML**，浏览器
+    会把标签拆开，点击行为就变得没道理了（点 × 变成点开、或者两个都不响应），
+    而这是纯 DOM 结构的事，控制台不会报错。
+
+    这条和一个 `#sessions` 的假盒子一起跑，验的就是那个结构。
+    """
+    checks = """
+function mkNode(tag) {
+  const n = { tag: tag, className: "", textContent: undefined, children: [], onclick: null };
+  n.appendChild = (c) => { n.children.push(c); return c; };
+  Object.defineProperty(n, "innerHTML",
+    { get: () => "", set: (v) => { if (v === "") n.children = []; } });
+  return n;
+}
+const document = { createElement: mkNode };
+const box = mkNode("div");
+const $ = (id) => (id === "sessions" ? box : mkNode("div"));
+const when = () => "刚刚";
+const openSession = () => {};
+let sessions = [{ id: "aaaaaaaaaaaa", turns: 2, busy: false,
+                 last_activity: "2026-09-22T10:00:00" }];
+let sessionId = "aaaaaaaaaaaa";
+%s
+%s
+
+renderList();
+
+if (box.children.length !== 1) { console.error("行数不对"); process.exit(1); }
+const row = box.children[0];
+if (row.className !== "session active") {
+  console.error("当前会话没高亮: " + row.className); process.exit(1);
+}
+if (row.children.length !== 2) {
+  console.error("一行该是两个按钮，拿到 " + row.children.length); process.exit(1);
+}
+const pick = row.children[0], kill = row.children[1];
+if (pick.tag !== "button" || kill.tag !== "button") {
+  console.error("不是按钮: " + pick.tag + " / " + kill.tag); process.exit(1);
+}
+if (kill.textContent !== "×") {
+  console.error("关闭按钮没有字: " + JSON.stringify(kill.textContent)); process.exit(1);
+}
+for (const b of [pick, kill]) {
+  if (b.children.some((c) => c.tag === "button")) {
+    console.error("按钮套按钮 —— 非法 HTML，点击会乱"); process.exit(1);
+  }
+}
+if (typeof pick.onclick !== "function" || typeof kill.onclick !== "function") {
+  console.error("有按钮没接点击"); process.exit(1);
+}
+""" % (_js_function("el"), _js_function("renderList"))
+
+    result = subprocess.run(
+        ["node", "-e", checks],
         capture_output=True,
         text=True,
         encoding="utf-8",

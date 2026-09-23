@@ -294,6 +294,24 @@ class SessionManager:
         with self._lock:
             self._sessions.pop(session_id, None)
 
+    def close(self, session_id: str) -> bool:
+        """关掉一个会话。返回「关的时候它还在跑」。
+
+        **先停再摘。** 不先停的话，那一轮会**没人看着继续跑完**：每次工具调用和
+        模型往返都是真调用，而结果发进一个已经没有订阅者的对象。停是尽力而为的
+        （模型调用拦不住，见 `fa/agent.py` 的 `Session.stop`），但至少不会让剩下
+        的工具接着跑。
+
+        摘掉的只是这个 `LiveSession`。已经落盘的东西（分类缓存、长期记忆）是
+        **所有会话共用**的，不归它，所以也不会跟着没。
+        """
+        live = self.get(session_id)
+        if live is None:
+            return False
+        running = live.stop()
+        self.drop(session_id)
+        return running
+
     def count(self) -> int:
         with self._lock:
             return len(self._sessions)
