@@ -36,8 +36,7 @@ eval = [
     "ragas",
     "langchain-community<0.4",
 ]
-# 第九天的 Web 前端单独列 —— CI 不需要它（前端代码在这个项目里没有测试，
-# 而后端那部分只用标准库 + FastAPI 的数据结构）。
+# Web 运行依赖单独列。CI 安装这一组验证 HTTP 路由；前端事件测试只需 Node。
 web = [
     "fastapi",
     "uvicorn",
@@ -64,9 +63,8 @@ rag = [
 # 不该让不需要它的人付安装成本。
 #
 # `fakeredis` 也在里面：它是纯 Python 的 Redis 实现，**同一套客户端 API**，
-# 用来在没有服务端的机器上验客户端代码。CI 装 `.[dev]`，所以那几条测试会跳过
-# —— 缓存**逻辑**由 `MemoryCache` 覆盖（那个不需要任何依赖），Redis 只覆盖
-# 往返那一条。
+# 用来在没有服务端的机器上验客户端代码。CI 安装 cache extra，验证客户端往返，
+# 不需要启动 Redis 服务。
 cache = [
     "redis",
     "fakeredis",

@@ -27,6 +27,10 @@ python -m fa                # 终端里用
 python -m web.server        # 或者浏览器里用 → http://127.0.0.1:8000
 ```
 
+Web 界面提供快捷提问、可恢复的会话入口、可展开的工具依据及图表、手机侧栏和回答复制。
+会话标题保存在当前浏览器，对话暂存于服务内存，重启后会清空。
+项目后续改进及验证方式见 [IMPROVEMENTS.md](IMPROVEMENTS.md)。
+
 能问出**可核对**的数字，能对账，能出月度报告：
 
 ```
@@ -387,6 +391,11 @@ assert "credit" not in out and "checking" not in out  # 没有账户
 python -m eval.collect      # 跑 agent，记下每次检索到什么
 python -m eval.ragas_run    # 跑三个指标，写 findings.md
 ```
+
+新增的100题评测草案、开发/测试划分、分层指标、严格消融脚本及Agent路由采集，见
+[评测使用说明](eval/README.md)、[逐题复核清单](eval/benchmark_review.md)和
+[开发集离线对照](eval/benchmark_baseline.md)。新题目前待人工复核；默认可离线运行
+`python -m eval.benchmark`，不会产生API费用。
 
 `eval/qa_cases.py` 里是 21 道题，**参考答案是人工照着语料逐条核对写的** ——
 这是 RAGAS 能不能信的前提。参考答案要是生成的，这个评测就变成了「模型 A 的

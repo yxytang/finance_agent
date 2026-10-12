@@ -238,9 +238,9 @@ def run(argv: list[str] | None = None) -> int:
                 # breadcrumb 是「文件 > 一级标题 > 二级标题 …」，所以判「命中哪个
                 # 小节」要看**结尾**，不能拼成 "文件 > 小节" 去比 —— 那样永远比不上。
                 suffix = f"> {case.heading}"
-                if crumbs and crumbs[0].endswith(suffix):
+                if hits and hits[0].chunk.source == case.source and crumbs[0].endswith(suffix):
                     head_at_1 += 1
-                if any(c.endswith(suffix) for c in crumbs):
+                if any(h.chunk.source == case.source and h.chunk.breadcrumb.endswith(suffix) for h in hits):
                     head_at_3 += 1
 
             base = grep_baseline(case.question)
@@ -259,7 +259,7 @@ def run(argv: list[str] | None = None) -> int:
         # 压到 2.20、字面的 @3/@5 提到 15/15，而 @1 一个都没动 —— 光看 @1
         # 会把一个有效的改动读成无效的。
         if ranks:
-            print(f"  期望文档的排名：命中 {len(ranks)}/{total}   平均 {sum(ranks)/len(ranks):.2f}")
+            print(f"  期望文档的排名：top3命中 {len(ranks)}/{total}   命中样本平均 {sum(ranks)/len(ranks):.2f}")
         print(f"  朴素grep  文件@1 {base_at_1}/{total}   文件@3 {base_at_3}/{total}")
         if misses:
             print("  文件级没命中的：")

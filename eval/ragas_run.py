@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 import warnings
@@ -135,10 +136,11 @@ def sanity_problem(samples: list[dict]) -> str | None:
     return None
 
 
-def load_samples() -> list[dict]:
-    if not OUT.is_file():
-        raise SystemExit(f"没有 {OUT}。先跑 `python -m eval.collect`。")
-    return json.loads(OUT.read_text(encoding="utf-8"))
+def load_samples(path: Path | None = None) -> list[dict]:
+    path = path or OUT
+    if not path.is_file():
+        raise SystemExit(f"没有 {path}。先采集评测样本。")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def to_dataset(samples: list[dict]) -> "EvaluationDataset":
@@ -164,9 +166,11 @@ def score_table(rows: list[dict], metrics: list[str], label: str) -> str:
     lines.append("| 指标 | 分数 |")
     lines.append("|---|---|")
     for name in metrics:
-        values = [r[name] for r in rows if isinstance(r.get(name), (int, float))]
+        values = [r[name] for r in rows if isinstance(r.get(name), (int, float)) and math.isfinite(r[name])]
         if values:
-            lines.append(f"| {name} | **{sum(values) / len(values):.2f}** |")
+            lines.append(f"| {name} | **{sum(values) / len(values):.2f}**（有效{len(values)}/{len(rows)}） |")
+        else:
+            lines.append(f"| {name} | 无有效分数（0/{len(rows)}） |")
     lines.append("")
     return "\n".join(lines)
 
@@ -174,9 +178,12 @@ def score_table(rows: list[dict], metrics: list[str], label: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m eval.ragas_run")
     parser.add_argument("--dry", action="store_true", help="只组装数据集，不调 LLM")
+    parser.add_argument("--input", type=Path, help="benchmark_agent导出的.ragas.json")
+    parser.add_argument("--output", type=Path, help="报告路径；自定义输入默认写eval/runs/ragas.md")
     args = parser.parse_args(argv)
 
-    samples = load_samples()
+    samples = load_samples(args.input)
+    output = args.output or (Path(__file__).parent / "runs" / "ragas.md" if args.input else FINDINGS)
     print(f"载入 {len(samples)} 个样本")
 
     problem = sanity_problem(samples)
@@ -184,12 +191,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"⚠️ 数据集有问题，不跑：{problem}")
         return 1
 
-    dataset = to_dataset(samples)
     if args.dry:
-        print("数据集组装成功（--dry，没调 LLM）：")
-        print(f"  字段：{list(dataset.samples[0].model_fields)}")
+        required = {"question", "reference", "response", "retrieved_contexts", "group", "source", "search_queries"}
+        if any(not required.issubset(s) for s in samples):
+            print("数据集缺少必需字段")
+            return 1
+        print("样本字段检查成功（--dry，未加载ragas、未调LLM）：")
         print(f"  平均检索块数：{sum(len(s['retrieved_contexts']) for s in samples) / len(samples):.1f}")
         return 0
+
+    dataset = to_dataset(samples)
 
     from ragas import evaluate
     from ragas.llms import LangchainLLMWrapper
@@ -212,6 +223,8 @@ def main(argv: list[str] | None = None) -> int:
 
     frame = result.to_pandas()
     rows = frame.to_dict("records")
+    if len(rows) != len(samples):
+        raise RuntimeError("RAGAS返回样本数不匹配，拒绝写入不完整成绩")
     for row, sample in zip(rows, samples):
         row["group"] = sample["group"]
 
@@ -223,17 +236,17 @@ def main(argv: list[str] | None = None) -> int:
     print(score_table([r for r in rows if r["group"] == "literal"], names, "字面问法"))
     print(score_table([r for r in rows if r["group"] == "paraphrased"], names, "换种说法"))
 
-    write_findings(rows, names, samples, elapsed)
-    print(f"\n写到 {FINDINGS}")
-    return 0
+    write_findings(rows, names, samples, elapsed, output=output)
+    print(f"\n写到 {output}")
+    return int(any(not isinstance(r.get(n), (int, float)) or not math.isfinite(r[n]) for r in rows for n in names))
 
 
-def write_findings(rows, names, samples, elapsed) -> None:
+def write_findings(rows, names, samples, elapsed, *, output=None) -> None:
     by_source = defaultdict(lambda: {"n": 0, "recall": []})
     for row, sample in zip(rows, samples):
         entry = by_source[sample["source"]]
         entry["n"] += 1
-        if isinstance(row.get("context_recall"), (int, float)):
+        if isinstance(row.get("context_recall"), (int, float)) and math.isfinite(row["context_recall"]):
             entry["recall"].append(row["context_recall"])
 
     empty = [s for s in samples if not s["retrieved_contexts"]]
@@ -242,7 +255,8 @@ def write_findings(rows, names, samples, elapsed) -> None:
         "# RAGAS 评测结果",
         "",
         f"生成时间：本文件由 `python -m eval.ragas_run` 写出，用时 {elapsed:.0f} 秒。",
-        f"样本：{len(samples)} 题（17 题字面问法 + 4 题换种说法）。",
+        f"样本：{len(samples)} 题；分组：" + ", ".join(f"{g}={sum(s['group'] == g for s in samples)}" for g in sorted({s['group'] for s in samples})),
+        "标注状态：" + ", ".join(sorted({s.get('annotation_status', 'legacy_reference') for s in samples})),
         f"judge：DeepSeek，遇到 {STATS['empty']} 次空回复（概率性内容过滤），重试 {STATS['retried']} 次。",
         "",
         "## 怎么读这三个数",
@@ -259,6 +273,9 @@ def write_findings(rows, names, samples, elapsed) -> None:
         score_table([r for r in rows if r["group"] == "literal"], names, "字面问法"),
         score_table([r for r in rows if r["group"] == "paraphrased"], names, "换种说法"),
     ]
+
+    for group in sorted({r["group"] for r in rows} - {"literal", "paraphrased"}):
+        body.append(score_table([r for r in rows if r["group"] == group], names, group))
 
     if empty:
         body += [
@@ -309,7 +326,9 @@ def write_findings(rows, names, samples, elapsed) -> None:
         "重跑一次分数会变几个百分点。所以看趋势，别看小数位。",
         "",
     ]
-    FINDINGS.write_text("\n".join(body), encoding="utf-8")
+    destination = output or FINDINGS
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(body), encoding="utf-8")
 
 
 def routing_section(samples: list[dict], rows: list[dict]) -> list[str]:
@@ -347,7 +366,10 @@ def routing_section(samples: list[dict], rows: list[dict]) -> list[str]:
     ]
     for group, items in by_group.items():
         did = [s for s in items if s["search_queries"]]
-        hit = [s for s in did if any(s["source"] in c for c in s["retrieved_contexts"])]
+        hit = [s for s in did if all(
+            any(source in c.split("\n", 1)[0] for c in s["retrieved_contexts"])
+            for source in s["source"].split(";")
+        )]
         lines.append(f"| {group} | {len(items)} | {len(did)}/{len(items)} | {len(hit)}/{len(items)} |")
 
     lines += [""]

@@ -177,8 +177,9 @@ def send(session_id: str, message: Message, request: Request) -> dict:
     with live.lock:
         if live.busy:
             raise HTTPException(status_code=409, detail="上一轮还没跑完")
+        # 先检查限流，再占用会话。429 不应把没有启动的会话永久锁成 busy。
+        _check_rate(session_id)
         live.busy = True
-    _check_rate(session_id)
 
     # 不在这里等 —— agent 跑一轮要几十秒，等着的话这个请求会超时，
     # 而结果是通过事件流回去的。这里立刻返回，让浏览器知道「开始了」。
