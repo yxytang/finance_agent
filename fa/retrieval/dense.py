@@ -65,15 +65,18 @@ class HttpEmbedder:
         from openai import OpenAI
 
         self._client = OpenAI(
-            api_key=settings.api_key, base_url=settings.embed_base_url
+            api_key=settings.api_key, base_url=settings.embed_base_url,
+            max_retries=0, timeout=15.0,
         )
         self.model_id = settings.embed_model
+        from fa.resilience import remote_policy
+        self._policy = remote_policy("embedding", settings.embed_base_url, self.model_id, settings.api_key)
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         out: list[list[float]] = []
         for start in range(0, len(texts), EMBED_BATCH):
             batch = list(texts[start : start + EMBED_BATCH])
-            resp = self._client.embeddings.create(model=self.model_id, input=batch)
+            resp = self._policy.call(lambda: self._client.embeddings.create(model=self.model_id, input=batch))
             # 按 index 排回来，不假定服务端保序
             out.extend(d.embedding for d in sorted(resp.data, key=lambda d: d.index))
         return out

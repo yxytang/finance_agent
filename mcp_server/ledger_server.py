@@ -38,6 +38,7 @@ MCP 只要实现一次协议。
 import argparse
 import csv
 import json
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -57,6 +58,12 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+MAX_ROWS = 200
+
+
+def _validate_limit(limit: int) -> None:
+    if type(limit) is not int or not 1 <= limit <= MAX_ROWS:
+        raise ValueError(f"limit 必须是 1..{MAX_ROWS} 的整数")
 
 
 def log(message: str) -> None:
@@ -74,12 +81,17 @@ class Ledger:
     一个 server 该做的就是把数据给出去，不是替客户端决定怎么用。
     """
 
-    def __init__(self, csv_path: Path):
+    def __init__(self, csv_path: Path, *, repository=None):
         self.csv_path = csv_path
+        self.repository = repository
         self._rows: list[dict] | None = None
 
     @property
     def rows(self) -> list[dict]:
+        if self.repository is not None:
+            return [{"txn_id": t.txn_id, "date": t.date.isoformat(), "amount": str(t.amount),
+                     "account": t.account, "merchant": t.merchant}
+                    for t in self.repository.list_transactions()]
         if self._rows is None:
             with self.csv_path.open("r", encoding="utf-8", newline="") as fh:
                 self._rows = list(csv.DictReader(fh))
@@ -93,8 +105,9 @@ class Ledger:
         **刻意不返回金额。** 「有哪些账户」这个问题不需要知道钱数，
         而少给一样东西就少一处泄漏。
         """
-        counts = Counter(row["account"] for row in self.rows)
-        lines = [f"共 {len(self.rows)} 笔交易，分布在 {len(counts)} 个账户："]
+        rows = self.rows
+        counts = Counter(row["account"] for row in rows)
+        lines = [f"共 {len(rows)} 笔交易，分布在 {len(counts)} 个账户："]
         for account, count in sorted(counts.items(), key=lambda kv: -kv[1]):
             lines.append(f"  {account}：{count} 笔")
         return "\n".join(lines)
@@ -108,6 +121,7 @@ class Ledger:
         注意这条边界是在**服务端**执行的，不是靠客户端自觉。客户端拿到的东西
         就这么多，它想多要也没有。
         """
+        _validate_limit(limit)
         counts = Counter(row["merchant"] for row in self.rows)
         items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
         lines = [f"共 {len(counts)} 个不同的商户（按笔数降序，最多 {limit} 个）："]
@@ -127,6 +141,7 @@ class Ledger:
         灌进调用方的上下文，而那是调用方**看不到也拦不住**的 —— 数据在服务端，
         决定给多少也在服务端。
         """
+        _validate_limit(limit)
         rows = self.rows
         if date_from:
             rows = [r for r in rows if r["date"] >= date_from]
@@ -168,6 +183,8 @@ TOOLS = [
             "properties": {
                 "limit": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_ROWS,
                     "description": "最多返回多少个商户，默认 200。",
                 }
             },
@@ -186,7 +203,8 @@ TOOLS = [
                 "date_from": {"type": "string", "description": "起始日期 YYYY-MM-DD，含当天。"},
                 "date_to": {"type": "string", "description": "结束日期 YYYY-MM-DD，含当天。"},
                 "account": {"type": "string", "description": "账户名，不传就是全部账户。"},
-                "limit": {"type": "integer", "description": "最多返回多少笔，默认 50。"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_ROWS,
+                          "description": "最多返回多少笔，默认 50，上限200。"},
             },
             "required": [],
         },
@@ -207,9 +225,13 @@ def _error(request_id, code: int, message: str) -> dict:
 
 def handle(request: dict, ledger: Ledger) -> dict | None:
     """处理一条 JSON-RPC 消息。返回 None 表示这是通知，不用回。"""
+    if not isinstance(request, dict):
+        return _error(None, INVALID_REQUEST, "请求必须是 JSON-RPC 对象")
     method = request.get("method")
     request_id = request.get("id")
-    params = request.get("params") or {}
+    params = request.get("params", {})
+    if not isinstance(params, dict):
+        return _error(request_id, INVALID_PARAMS, "params 必须是对象")
 
     if method == "initialize":
         # 客户端报它想用的版本，我们支持就跟着它，不支持就报我们最新的。
@@ -235,8 +257,10 @@ def handle(request: dict, ledger: Ledger) -> dict | None:
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
+        if not isinstance(name, str):
+            return _error(request_id, INVALID_PARAMS, "工具名必须是字符串")
         handler = {
-            "list_accounts": lambda **_: ledger.list_accounts(),
+            "list_accounts": ledger.list_accounts,
             "list_merchants": ledger.list_merchants,
             "fetch_transactions": ledger.fetch_transactions,
         }.get(name)
@@ -246,7 +270,7 @@ def handle(request: dict, ledger: Ledger) -> dict | None:
 
         try:
             text = handler(**arguments)
-        except TypeError as exc:
+        except (TypeError, ValueError) as exc:
             # 参数不匹配是**调用方**的问题，要让它能看懂并改 —— 所以走
             # isError 而不是 JSON-RPC error：前者是「工具执行失败」，
             # 后者是「协议层出错」，客户端的处理方式不一样。
@@ -285,12 +309,18 @@ def main(argv: list[str] | None = None) -> int:
     # 而这个模块是要被测试 import 的。
     sys.stdout.reconfigure(encoding="utf-8")
 
-    if not args.data.is_file():
+    database_url = os.environ.get("FINANCE_LEDGER_DATABASE_URL", "")
+    if not database_url and not args.data.is_file():
         log(f"找不到账单：{args.data}")
         return 1
 
-    ledger = Ledger(args.data)
-    log(f"{SERVER_NAME} 启动，数据来自 {args.data}")
+    repository = None
+    if database_url:
+        from backend.db import Database
+        from backend.ledger import LedgerRepository
+        repository = LedgerRepository(Database(database_url))
+    ledger = Ledger(args.data, repository=repository)
+    log(f"{SERVER_NAME} 启动，数据来自 {'关系数据库' if repository else args.data}")
 
     for line in sys.stdin:
         line = line.strip()

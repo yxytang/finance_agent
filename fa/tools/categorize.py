@@ -32,7 +32,7 @@ def _paths():
     return config.CATEGORY_CACHE, config.MEMORY_FILE
 
 
-def build_categorize_tools(confirm: Confirm | None = None) -> list[BaseTool]:
+def build_categorize_tools(confirm: Confirm | None = None, *, repository=None) -> list[BaseTool]:
     @tool
     def correct_category(merchant: str, category: str) -> str:
         """用户说某个商户的分类归错了时用它纠正。**纠正之后一直生效。**
@@ -47,6 +47,30 @@ def build_categorize_tools(confirm: Confirm | None = None) -> list[BaseTool]:
         if category not in CATEGORIES:
             return (
                 f"没有「{category}」这个类目。可选的只有：{'、'.join(CATEGORIES)}"
+            )
+
+        if repository is not None:
+            import uuid
+            from backend.ledger import LedgerConflict
+            key = normalize(merchant)
+            state = repository.category_state(key)
+            if state is None:
+                return f"账单中没有「{key}」这个商户，请先核对商户名称。"
+            if state["category"] == category:
+                return f"「{key}」本来就是「{category}」，不用改。"
+            if confirm is not None and not confirm(
+                f"把「{key}」的类目从「{state['category']}」改成「{category}」（以后一直生效）"
+            ):
+                return "用户拒绝了这次修改，没有改动。"
+            try:
+                result = repository.correct_category(
+                    key, category, expected_version=state["version"], request_id=uuid.uuid4().hex,
+                )
+            except LedgerConflict:
+                return "确认期间分类已被其他操作修改，请重新查询当前分类后再确认。"
+            return (
+                f"已改：「{key}」的类目从「{result['before_category']}」改成「{category}」。\n"
+                f"账单查询已生效，分类与审计记录已在同一事务中保存（版本 {result['version']}）。"
             )
 
         cache_path, memory_path = _paths()

@@ -27,12 +27,8 @@ def test_rate_limited_request_leaves_session_idle(monkeypatch):
     assert live.events == []
     # 限流结束后，同一会话仍然能接收问题。
     monkeypatch.setattr(server, "TURNS_PER_MINUTE", 6)
-    class NoopThread:
-        def __init__(self, **kwargs):
-            pass
-
-        def start(self):
-            pass
-
-    monkeypatch.setattr(server.threading, "Thread", NoopThread)
+    accepted = []
+    monkeypatch.setattr(manager, "submit", lambda live, text: accepted.append((live.id, text)))
     assert server.send(live.id, server.Message(text="查看账单范围"), request)["accepted"]
+    assert accepted == [(live.id, "查看账单范围")]
+    manager.shutdown()

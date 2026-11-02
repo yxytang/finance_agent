@@ -123,7 +123,7 @@ def readonly_tools(get_bill: Bill) -> list:
     这里只决定「哪些可以用」。两处定义就会漂移，然后有一处忘了改，
     子 agent 就拿到了不该拿的工具。
     """
-    return [t for t in build_tools(get_bill=get_bill) if t.name in SUBAGENT_TOOLS]
+    return [t for t in build_tools(get_bill=get_bill, use_mcp=False) if t.name in SUBAGENT_TOOLS]
 
 
 def _context_chars(messages: list) -> int:

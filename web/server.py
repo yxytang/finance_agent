@@ -35,16 +35,18 @@ import sys
 import threading
 import time
 from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from web.charts import extract_series
-from web.sessions import SessionManager, stream
+from web.sessions import SessionManager, stream, SessionBusy, ExecutionQueueFull, ManagerClosed
 
 HERE = Path(__file__).resolve().parent
 
@@ -54,8 +56,36 @@ WEB_TOKEN = os.environ.get("FINANCE_WEB_TOKEN", "").strip()
 # 限流：每个会话每分钟最多几轮。默认给得宽松，因为它挡的是「刷」，不是「用」。
 TURNS_PER_MINUTE = int(os.environ.get("FINANCE_WEB_TURNS_PER_MINUTE", "6"))
 
-app = FastAPI(title="finance_agent web", docs_url=None, redoc_url=None)
 manager = SessionManager()
+runtime = None
+
+
+@asynccontextmanager
+async def lifespan(app):
+    global runtime, manager
+    from backend.runtime import Runtime
+    runtime = Runtime()
+    manager = runtime.manager
+    try:
+        yield
+    finally:
+        await run_in_threadpool(runtime.close)
+        runtime = None
+        manager = SessionManager()
+
+
+app = FastAPI(title="finance_agent web", docs_url=None, redoc_url=None, lifespan=lifespan)
+
+
+def _runtime():
+    if runtime is None:
+        raise HTTPException(503, detail="后端正在启动，请稍后重试")
+    return runtime
+
+
+def _knowledge_root():
+    from fa.config import KNOWLEDGE_DIR
+    return KNOWLEDGE_DIR
 
 _rate: dict[str, deque] = defaultdict(deque)
 _rate_lock = threading.Lock()
@@ -67,6 +97,7 @@ class Message(BaseModel):
 
 class Verdict(BaseModel):
     allow: bool
+    confirmation_id: str | None = None
 
 
 # --- 访问控制 -----------------------------------------------------------
@@ -126,6 +157,8 @@ def health() -> dict:
         "sessions": manager.count(),
         "auth": bool(WEB_TOKEN),
         "turns_per_minute": TURNS_PER_MINUTE,
+        "persistence": runtime is not None,
+        "document_worker": os.environ.get("FINANCE_DOCUMENT_WORKER", "embedded"),
     }
 
 
@@ -137,6 +170,131 @@ def create_session(request: Request) -> dict:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"id": live.id}
+
+
+@app.get("/api/knowledge")
+def knowledge_files(request: Request) -> dict:
+    _check(request)
+    from fa.knowledge import inventory
+    return inventory(_knowledge_root())
+
+
+@app.post("/api/knowledge/files/{filename}", status_code=202)
+async def upload_knowledge(filename: str, request: Request) -> dict:
+    _check(request)
+    from fa.knowledge import validate_filename
+    from fa.retrieval.documents import DocumentError, MAX_FILE_BYTES
+    try:
+        validate_filename(filename)
+    except DocumentError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+    content = bytearray()
+    async for block in request.stream():
+        if len(content) + len(block) > MAX_FILE_BYTES:
+            raise HTTPException(413, detail="单个文件不能超过20MB")
+        content.extend(block)
+    try:
+        return await run_in_threadpool(_runtime().jobs.submit, _knowledge_root(), filename, bytes(content))
+    except FileExistsError as exc:
+        raise HTTPException(409, detail=str(exc)) from exc
+    except DocumentError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str, request: Request):
+    _check(request)
+    result = _runtime().jobs.get(job_id)
+    if result is None:
+        raise HTTPException(404, detail="没有这个入库任务")
+    return result
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, request: Request):
+    _check(request)
+    result = _runtime().jobs.cancel(job_id)
+    if result is None:
+        raise HTTPException(404, detail="没有这个入库任务")
+    return result
+
+
+@app.post("/api/jobs/{job_id}/retry", status_code=202)
+def retry_job(job_id: str, request: Request):
+    _check(request)
+    try:
+        result = _runtime().jobs.retry(job_id)
+    except ValueError as exc:
+        raise HTTPException(409, detail=str(exc)) from exc
+    if result is None:
+        raise HTTPException(404, detail="没有这个入库任务")
+    return result
+
+
+@app.post("/api/ledger/import", status_code=201)
+async def import_ledger(request: Request):
+    """CSV import is atomic; repeated source records never create new charges."""
+    _check(request)
+    import tempfile
+    from fa.categorize import categorize
+    from fa.ingest import load_transactions, IngestError
+    from backend.ledger import LedgerConflict, LedgerValidationError
+    content = bytearray()
+    async for block in request.stream():
+        if len(content) + len(block) > 20 * 1024 * 1024:
+            raise HTTPException(413, detail="账单文件不能超过20MB")
+        content.extend(block)
+    def execute():
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "import.csv"
+            path.write_bytes(content)
+            tagged, _ = categorize(load_transactions(path), use_llm=False)
+            return _runtime().ledger.import_csv(path, transactions=tagged)
+    try:
+        return await run_in_threadpool(execute)
+    except LedgerConflict as exc:
+        raise HTTPException(409, detail=str(exc)) from exc
+    except (IngestError, LedgerValidationError, UnicodeError) as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+
+
+@app.get("/api/finance/summary")
+def finance_summary(request: Request, account: str | None = None):
+    """Asynchronous projections, not the authoritative live ledger query."""
+    _check(request)
+    from backend.projections import ProjectionService
+    from backend.outbox import event_status
+    db = _runtime().db
+    return {"items": ProjectionService(db).summary(account), "status": event_status(db)}
+
+
+@app.get("/api/finance/anomalies")
+def finance_anomalies(request: Request, account: str | None = None):
+    _check(request)
+    from backend.projections import ProjectionService
+    from backend.outbox import event_status
+    db = _runtime().db
+    return {"items": ProjectionService(db).anomalies(account), "status": event_status(db),
+            "description": "同账户、同商户、同正金额且相邻间隔不超过3天的疑似重复扣款，需人工核对"}
+
+
+@app.get("/api/finance/events/status")
+def finance_events_status(request: Request):
+    _check(request)
+    from backend.outbox import event_status
+    return event_status(_runtime().db)
+
+
+@app.get("/api/knowledge/source")
+def knowledge_source(path: str, request: Request):
+    _check(request)
+    from fa.retrieval.documents import SUFFIXES
+    root = _knowledge_root().resolve()
+    target = (root / path).resolve()
+    if (not target.is_relative_to(root) or not target.is_file() or target.suffix.lower() not in SUFFIXES
+            or any(p.startswith(".") for p in target.relative_to(root).parts)):
+        raise HTTPException(404, detail="找不到知识库原文件")
+    return FileResponse(target, filename=target.name, media_type="application/octet-stream")
 
 
 @app.get("/api/sessions")
@@ -159,9 +317,16 @@ def events(session_id: str, request: Request):
 
     # **先 subscribe 再返回**：订阅动作里带着回放，必须发生在响应开始流式输出
     # 之前。放在生成器里做的话，中间产生的事件会掉进缝隙里。
-    listener = live.subscribe()
+    raw_cursor = request.headers.get("last-event-id") or request.query_params.get("after", "0")
+    try:
+        after_seq = int(raw_cursor)
+        if after_seq < 0:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(422, detail="事件序号必须是非负整数")
+    listener = live.subscribe(after_seq=after_seq)
     return StreamingResponse(
-        stream(live, listener),
+        stream(live, listener, after_seq=after_seq),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -174,16 +339,15 @@ def send(session_id: str, message: Message, request: Request) -> dict:
     if live is None:
         raise HTTPException(status_code=404, detail="没有这个会话")
 
-    with live.lock:
-        if live.busy:
-            raise HTTPException(status_code=409, detail="上一轮还没跑完")
-        # 先检查限流，再占用会话。429 不应把没有启动的会话永久锁成 busy。
-        _check_rate(session_id)
-        live.busy = True
-
-    # 不在这里等 —— agent 跑一轮要几十秒，等着的话这个请求会超时，
-    # 而结果是通过事件流回去的。这里立刻返回，让浏览器知道「开始了」。
-    threading.Thread(target=live.run, args=(message.text,), daemon=True).start()
+    _check_rate(session_id)
+    try:
+        manager.submit(live, message.text)
+    except SessionBusy as exc:
+        raise HTTPException(409, detail="上一轮还没跑完") from exc
+    except ExecutionQueueFull as exc:
+        raise HTTPException(429, detail="分析任务已满，请稍后再试") from exc
+    except ManagerClosed as exc:
+        raise HTTPException(503, detail="服务正在关闭") from exc
     return {"accepted": True}
 
 
@@ -194,7 +358,10 @@ def confirm(session_id: str, verdict: Verdict, request: Request) -> dict:
     if live is None:
         raise HTTPException(status_code=404, detail="没有这个会话")
 
-    if not live.answer(verdict.allow):
+    if runtime is not None and not verdict.confirmation_id:
+        raise HTTPException(422, detail="请携带当前确认请求的编号，刷新页面后重试")
+
+    if not live.answer(verdict.allow, confirmation_id=verdict.confirmation_id):
         # 没有人在等 —— 多半是重复点击，或者上一次已经超时了。
         # 返回 200 而不是错误：对用户来说这不是失败。
         return {"accepted": False, "reason": "没有正在等待的确认"}
@@ -223,7 +390,7 @@ def stop_turn(session_id: str, request: Request) -> dict:
 def close_session(session_id: str, request: Request) -> dict:
     """关掉一个会话 —— 连同它的历史一起。
 
-    **这是真的会丢东西的**（对话只在内存里），所以前端有内容的会话会先问一句。
+    会删除数据库中的会话及事件日志，所以前端有内容的会话会先问一句。
     接口本身不拦：反复关同一个会话，第二次给 404，对用户来说不是失败。
 
     正在跑的话先停掉再摘（见 `SessionManager.close` 的说明）。

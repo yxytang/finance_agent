@@ -53,6 +53,7 @@ def render_data_section() -> str:
         f"**类目是固定这 {len(CATEGORIES)} 个，不要自己发明新的**：\n\n"
         f"{listed}\n\n"
         "不确定数据的时间跨度、账户有哪些时，先调 `describe_data` 看一眼再回答。"
+        "商户当前分类以账单工具的最新查询结果为准；长期记忆可能记录旧分类，不得覆盖最新账单。"
     )
 
 

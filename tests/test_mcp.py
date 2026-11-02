@@ -8,7 +8,11 @@
 import json
 import re
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from decimal import Decimal
 
 import pytest
 
@@ -327,3 +331,146 @@ def test_mount_tools_returns_empty_and_warns_on_failure(capsys):
 
     assert tools == []
     assert "MCP 工具没挂上" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("limit", [None, 0, -1, 201, True, False, 1.0, 1.5, "2", []])
+@pytest.mark.parametrize("tool_name", ["list_merchants", "fetch_transactions"])
+def test_ledger_rejects_out_of_range_and_non_integer_limits(ledger, tool_name, limit):
+    with pytest.raises(ValueError, match="limit"):
+        getattr(ledger, tool_name)(limit=limit)
+    reply = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": tool_name, "arguments": {"limit": limit}}}, ledger)
+    assert reply["result"]["isError"]
+    assert "limit" in reply["result"]["content"][0]["text"]
+
+
+def test_limit_schemas_expose_the_service_boundary(ledger):
+    for spec in TOOLS:
+        if spec["name"] in ("list_merchants", "fetch_transactions"):
+            limit = spec["inputSchema"]["properties"]["limit"]
+            assert (limit["minimum"], limit["maximum"]) == (1, 200)
+            assert not handle({"id": 1, "method": "tools/call", "params": {
+                "name": spec["name"], "arguments": {"limit": 200}}}, ledger)["result"].get("isError")
+
+
+def test_list_accounts_uses_one_repository_snapshot(tmp_path):
+    from fa.models import Transaction
+
+    class ChangingRepository:
+        calls = 0
+
+        def list_transactions(self):
+            self.calls += 1
+            return [Transaction(date(2026, 1, 1), "merchant", Decimal("1.00"), "checking", str(i))
+                    for i in range(self.calls)]
+
+    repository = ChangingRepository()
+    out = Ledger(tmp_path / "unused.csv", repository=repository).list_accounts()
+    assert repository.calls == 1
+    assert "共 1 笔" in out and "checking：1 笔" in out
+
+
+def test_database_mcp_subprocess_sees_committed_imports_without_restart(tmp_path):
+    from backend.db import Database
+    from backend.ledger import LedgerRepository
+    from fa.models import Transaction
+
+    db = Database(f"sqlite:///{(tmp_path / 'ledger.sqlite3').as_posix()}")
+    db.create_schema()
+    repo = LedgerRepository(db)
+    repo.import_transactions([Transaction(date(2026, 1, 1), "DB_ONLY_MERCHANT", Decimal("1.01"),
+                                          "test_account", "DBT1", "购物")], source_name="first")
+    try:
+        with ledger_client(database_url=db.url) as client:
+            client.initialize()
+            assert "共 1 笔" in client.call_tool("list_accounts")
+            out = client.call_tool("fetch_transactions")
+            assert "DB_ONLY_MERCHANT" in out and "DBT1" in out and "1.01" in out
+            repo.import_transactions([Transaction(date(2026, 1, 2), "NEXT_DB_MERCHANT", Decimal("-0.01"),
+                                                  "new_account", "DBT2", "购物")], source_name="next")
+            assert "共 2 笔" in client.call_tool("list_accounts")
+            assert "new_account" in client.call_tool("list_accounts")
+            assert "NEXT_DB_MERCHANT" in client.call_tool("list_merchants")
+            assert "-0.01" in client.call_tool("fetch_transactions")
+    finally:
+        db.dispose()
+
+
+_ECHO_SERVER = """import json,sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    print(json.dumps({'jsonrpc':'2.0','method':'notifications/log','params':{}}),flush=True)
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':request.get('params',{})}),flush=True)
+"""
+
+
+def test_concurrent_requests_keep_their_own_replies_and_fixed_io_threads():
+    client = StdioClient([sys.executable, "-u", "-c", _ECHO_SERVER], timeout=5)
+    with client:
+        transport = client._transport
+        reader, writer = transport.reader, transport.writer
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            replies = list(pool.map(lambda value: client.request("echo", {"value": value}), range(40)))
+        assert [reply["value"] for reply in replies] == list(range(40))
+        assert client._transport.reader is reader and client._transport.writer is writer
+    assert transport.process.poll() is not None
+    assert not reader.is_alive() and not writer.is_alive()
+
+
+@pytest.mark.parametrize("params", [{}, {"oversized_for_pipe": "x" * 1_000_000}])
+def test_response_and_full_stdin_pipe_timeout_reap_process_and_io_threads(params):
+    client = StdioClient([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.2)
+    client.start()
+    transport = client._transport
+    started = time.monotonic()
+    with pytest.raises(MCPError, match="超时"):
+        client.request("hang", params)
+    assert time.monotonic() - started < 3
+    assert client._process is None
+    assert transport.process.poll() is not None
+    assert not transport.reader.is_alive() and not transport.writer.is_alive()
+    with pytest.raises(MCPError, match="关闭|启动"):
+        client.request("after-timeout")
+    client.close()
+
+
+def test_close_interrupts_waiting_request_without_waiting_for_request_lock():
+    client = StdioClient([sys.executable, "-c", "import time; time.sleep(30)"], timeout=10)
+    client.start()
+    transport = client._transport
+    reached_read = threading.Event()
+    original_read = client._read_reply
+
+    def observed_read(*args):
+        reached_read.set()
+        return original_read(*args)
+
+    client._read_reply = observed_read
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        request = pool.submit(client.request, "hang")
+        assert reached_read.wait(2)
+        started = time.monotonic()
+        client.close()
+        assert time.monotonic() - started < 3
+        with pytest.raises(MCPError, match="关闭"):
+            request.result(timeout=1)
+    assert transport.process.poll() is not None
+    assert not transport.reader.is_alive() and not transport.writer.is_alive()
+
+
+def test_continuous_notifications_do_not_extend_response_deadline():
+    code = "import time;\nwhile True:\n print('{\"jsonrpc\":\"2.0\",\"method\":\"notification\"}',flush=True)"
+    client = StdioClient([sys.executable, "-u", "-c", code], timeout=0.2)
+    client.start()
+    transport = client._transport
+    with pytest.raises(MCPError, match="超时"):
+        client.request("no-response")
+    assert transport.process.poll() is not None
+    assert not transport.reader.is_alive() and not transport.writer.is_alive()
+
+
+def test_sandbox_overrides_cannot_smuggle_api_keys():
+    with pytest.raises(ValueError, match="allowlist"):
+        StdioClient([sys.executable], env_overrides={"DEEPSEEK_API_KEY": "test-only-not-a-real-key"})

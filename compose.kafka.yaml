@@ -1,0 +1,107 @@
+# Optional local event pipeline. Combine with compose.yaml; do not run alone.
+# docker compose -f compose.yaml -f compose.kafka.yaml up --build -d
+x-finance-kafka-environment: &finance-kafka-environment
+  FINANCE_DB_HOST: postgres
+  FINANCE_DB_PORT: "5432"
+  FINANCE_DB_USER: finance
+  FINANCE_DB_NAME: finance
+  FINANCE_DB_PASSWORD: ${FINANCE_DB_PASSWORD:?Set FINANCE_DB_PASSWORD in your shell or .env}
+  FINANCE_AUTO_CREATE_SCHEMA: "0"
+  FINANCE_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  FINANCE_KAFKA_TOPIC: ${FINANCE_KAFKA_TOPIC:-finance.ledger.v1}
+  FINANCE_KAFKA_GROUP_PREFIX: ${FINANCE_KAFKA_GROUP_PREFIX:-finance}
+
+x-finance-kafka-worker: &finance-kafka-worker
+  image: ${FINANCE_IMAGE:-finance-agent:local}
+  build: .
+  init: true
+  environment: *finance-kafka-environment
+  # Poison events deliberately stop consumers until repaired; avoid restart loops.
+  restart: "no"
+  stop_grace_period: 90s
+
+services:
+  api:
+    environment:
+      FINANCE_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      FINANCE_KAFKA_TOPIC: ${FINANCE_KAFKA_TOPIC:-finance.ledger.v1}
+      FINANCE_KAFKA_GROUP_PREFIX: ${FINANCE_KAFKA_GROUP_PREFIX:-finance}
+
+  kafka:
+    image: apache/kafka:4.1.2
+    hostname: kafka
+    ports:
+      - "127.0.0.1:9092:9092"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:29093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://127.0.0.1:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: "3"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_LOG_RETENTION_HOURS: "168"
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:29092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  init-topics:
+    <<: *finance-kafka-worker
+    command: ["python", "-m", "backend.kafka_worker", "init-topics"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  kafka-backfill:
+    <<: *finance-kafka-worker
+    command: ["python", "-m", "backend.kafka_worker", "backfill"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  kafka-publisher:
+    <<: *finance-kafka-worker
+    command: ["python", "-m", "backend.kafka_worker", "publish"]
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+      kafka-backfill:
+        condition: service_completed_successfully
+
+  kafka-summary:
+    <<: *finance-kafka-worker
+    command: ["python", "-m", "backend.kafka_worker", "consume", "--projection", "summary"]
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  kafka-anomalies:
+    <<: *finance-kafka-worker
+    command: ["python", "-m", "backend.kafka_worker", "consume", "--projection", "anomalies"]
+    depends_on:
+      init-topics:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  kafka_data:

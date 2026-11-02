@@ -9,7 +9,7 @@ agent.py 一行都没改，这就是这层存在的意义。
 """
 
 import atexit
-from functools import lru_cache
+import threading
 
 from langchain_core.tools import BaseTool
 
@@ -30,8 +30,11 @@ from fa.tools.skills import build_skill_tools
 MCP_PREFIX = "ledger__"
 
 
-@lru_cache(maxsize=1)
-def _mcp_tools() -> tuple[BaseTool, ...]:
+_mcp_registry = {}
+_mcp_lock = threading.Lock()
+
+
+def _mcp_tools(database_url: str | None = None) -> tuple[BaseTool, ...]:
     """连一次账单 server，把它暴露的工具全挂上。
 
     **进程内只连一次**：每次都起一个子进程的话，测试里几十次 Session 构造
@@ -43,13 +46,26 @@ def _mcp_tools() -> tuple[BaseTool, ...]:
     from fa.mcp import ledger_client
     from fa.mcp.adapt import mount_tools
 
-    client = ledger_client()
-    tools = tuple(mount_tools(client, prefix=MCP_PREFIX))
-    if tools:
-        # 进程退出时把子进程收掉。不注册的话，退出时可能留下一个孤儿进程
-        # —— 而它的 stdin 已经关了，它会一直等在 readline 上。
-        atexit.register(client.close)
-    return tools
+    with _mcp_lock:
+        if database_url in _mcp_registry:
+            return _mcp_registry[database_url][1]
+        client = ledger_client(database_url=database_url) if database_url else ledger_client()
+        tools = tuple(mount_tools(client, prefix=MCP_PREFIX))
+        if tools:
+            _mcp_registry[database_url] = (client, tools)
+            atexit.register(client.close)
+        else:
+            client.close()
+        return tools
+
+
+def close_mcp(database_url: str | None = None):
+    """Close this runtime's subprocess after all turns have drained."""
+    with _mcp_lock:
+        entry = _mcp_registry.pop(database_url, None)
+    if entry:
+        atexit.unregister(entry[0].close)
+        entry[0].close()
 
 
 def build_tools(
@@ -57,6 +73,8 @@ def build_tools(
     get_bill: Bill | None = None,
     *,
     use_mcp: bool = True,
+    repository=None,
+    database_url: str | None = None,
 ) -> list[BaseTool]:
     """构造这个 Session 能用的全部工具。
 
@@ -69,11 +87,11 @@ def build_tools(
         *build_anomaly_tools(bill),
         *build_forecast_tools(bill),
         *build_knowledge_tools(),
-        *build_categorize_tools(confirm),
+        *build_categorize_tools(confirm, repository=repository),
         *build_memory_tools(),
         *build_skill_tools(),
         *build_delegate_tools(bill),
     ]
     if use_mcp:
-        tools.extend(_mcp_tools())
+        tools.extend(_mcp_tools(database_url) if database_url else _mcp_tools())
     return tools

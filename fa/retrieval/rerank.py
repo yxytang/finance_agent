@@ -40,7 +40,7 @@ from fa.retrieval.hybrid import Hit
 RERANK_CANDIDATES = 20
 
 # 网络超时。重排在用户等答案的路径上，不能无限期挂着。
-TIMEOUT = 30.0
+TIMEOUT = 15.0
 
 _rerank_warned = False
 
@@ -68,27 +68,32 @@ class HttpReranker:
         self._url = settings.rerank_base_url
         self._key = settings.api_key
         self.model_id = settings.rerank_model
+        from fa.resilience import remote_policy
+        self._policy = remote_policy("rerank", self._url, self.model_id, self._key)
 
     def scores(self, query: str, documents: list[str]) -> list[float | None]:
         import httpx
 
-        response = httpx.post(
-            self._url,
-            headers={
-                "Authorization": f"Bearer {self._key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model_id,
-                "input": {"query": query, "documents": documents},
-                "parameters": {
-                    "return_documents": False,
-                    "top_n": len(documents),
+        def request():
+            response = httpx.post(
+                self._url,
+                headers={
+                    "Authorization": f"Bearer {self._key}",
+                    "Content-Type": "application/json",
                 },
-            },
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
+                json={
+                    "model": self.model_id,
+                    "input": {"query": query, "documents": documents},
+                    "parameters": {
+                        "return_documents": False,
+                        "top_n": len(documents),
+                    },
+                },
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            return response
+        response = self._policy.call(request)
         results = response.json()["output"]["results"]
 
         # 先铺一层 None，再按 index 填 —— 服务端只回它认为相关的那几条，

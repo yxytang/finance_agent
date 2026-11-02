@@ -1,0 +1,99 @@
+{
+  "synthetic": true,
+  "label": "模拟数据，仅用于系统演示",
+  "created_on": "2026-10-19",
+  "files": [
+    "模拟_2026年9月收支报告.pdf",
+    "模拟_差旅报销规则与案例.pdf",
+    "模拟_2026年9月财务复盘.pptx",
+    "模拟_2026年10月12日消费记录.png",
+    "模拟_2026年10月订阅清单.jpg"
+  ],
+  "cases": [
+    {
+      "file": "模拟_2026年9月收支报告.pdf",
+      "question": "根据模拟的2026年9月收支报告，收入、总支出和月结余分别是多少？",
+      "values": [
+        "15000.00",
+        "8600.00",
+        "6400.00"
+      ],
+      "answer": "收入15000元，总支出8600元，月结余6400元。",
+      "expected_source": "uploads/模拟_2026年9月收支报告.pdf",
+      "retrieval_passed": true,
+      "matched_locations": [
+        "uploads/模拟_2026年9月收支报告.pdf > 第1页",
+        "uploads/模拟_2026年9月收支报告.pdf > 第2页"
+      ]
+    },
+    {
+      "file": "模拟_差旅报销规则与案例.pdf",
+      "question": "模拟差旅报销案例的合计金额是多少，住宿报销金额是多少？",
+      "values": [
+        "906.50",
+        "520.00"
+      ],
+      "answer": "合计906.50元，住宿两晚共520元。",
+      "expected_source": "uploads/模拟_差旅报销规则与案例.pdf",
+      "retrieval_passed": true,
+      "matched_locations": [
+        "uploads/模拟_差旅报销规则与案例.pdf > 第1页",
+        "uploads/模拟_差旅报销规则与案例.pdf > 第2页"
+      ]
+    },
+    {
+      "file": "模拟_2026年9月财务复盘.pptx",
+      "question": "模拟10月行动计划中购物预算如何调整，每月储备转存是多少？",
+      "values": [
+        "700",
+        "3000"
+      ],
+      "answer": "购物预算从900元降至700元，每月向储备资金转存3000元。",
+      "expected_source": "uploads/模拟_2026年9月财务复盘.pptx",
+      "retrieval_passed": true,
+      "matched_locations": [
+        "uploads/模拟_2026年9月财务复盘.pptx > 幻灯片1 > 备注",
+        "uploads/模拟_2026年9月财务复盘.pptx > 幻灯片4 > 备注",
+        "uploads/模拟_2026年9月财务复盘.pptx > 幻灯片3 > 备注",
+        "uploads/模拟_2026年9月财务复盘.pptx > 幻灯片2 > 备注"
+      ]
+    },
+    {
+      "file": "模拟_2026年10月12日消费记录.png",
+      "question": "根据模拟的2026年10月12日消费记录，当日支出合计多少？",
+      "values": [
+        "124.90"
+      ],
+      "answer": "124.90元，由23.00、12.00和89.90元组成。",
+      "expected_source": "uploads/模拟_2026年10月12日消费记录.png",
+      "retrieval_passed": true,
+      "matched_locations": [
+        "uploads/模拟_2026年10月12日消费记录.png > 图片第1页"
+      ]
+    },
+    {
+      "file": "模拟_2026年10月订阅清单.jpg",
+      "question": "模拟2026年10月订阅清单的月费合计是多少，云存储何时扣款？",
+      "values": [
+        "79.00",
+        "2026-10-21"
+      ],
+      "answer": "每月合计79.00元，云存储下次扣款日为2026-10-21。",
+      "expected_source": "uploads/模拟_2026年10月订阅清单.jpg",
+      "retrieval_passed": true,
+      "matched_locations": [
+        "uploads/模拟_2026年10月订阅清单.jpg > 图片第1页"
+      ]
+    }
+  ],
+  "retrieval_mode": "bm25 top5; smoke checks, not benchmark accuracy",
+  "new_chunks": 17,
+  "knowledge_total_files": 17,
+  "known_hard_queries": [
+    {
+      "question": "模拟2026年9月财务复盘中，10月购物预算和每月转存目标是多少？",
+      "all_values_in_top5": false,
+      "note": "长问法含多个月份，词法前5可能被标题日期干扰；精简到行动计划主题后可命中。"
+    }
+  ]
+}

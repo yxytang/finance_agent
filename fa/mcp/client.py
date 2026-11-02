@@ -25,6 +25,11 @@
 
 import json
 import os
+import math
+import queue
+import threading
+import time
+from dataclasses import dataclass, field
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +39,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 LEDGER_SERVER = PROJECT_ROOT / "mcp_server" / "ledger_server.py"
 
 DEFAULT_TIMEOUT = 30.0
+MAX_REPLY_CHARS = 1_000_000
 
 
 class MCPError(RuntimeError):
@@ -44,51 +50,146 @@ class MCPError(RuntimeError):
     """
 
 
-class StdioClient:
-    """把一个 MCP server 当子进程起来，通过标准输入输出和它说话。"""
+@dataclass
+class _Transport:
+    process: subprocess.Popen
+    stopped: threading.Event = field(default_factory=threading.Event)
+    replies: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=128))
+    writes: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=1))
+    reader: threading.Thread | None = None
+    writer: threading.Thread | None = None
 
-    def __init__(self, command: list[str], *, cwd: Path | None = None, sandbox: bool = True):
+
+def _offer(transport: _Transport, value) -> None:
+    while not transport.stopped.is_set():
+        try:
+            transport.replies.put(value, timeout=0.1)
+            return
+        except queue.Full:
+            pass
+
+
+def _reader_loop(transport: _Transport) -> None:
+    """One reader per connection; never one blocked thread per request."""
+    try:
+        while not transport.stopped.is_set():
+            line = transport.process.stdout.readline(MAX_REPLY_CHARS + 1)
+            if len(line) > MAX_REPLY_CHARS:
+                _offer(transport, ("error", MCPError("MCP server 响应超过大小上限")))
+                return
+            if not line:
+                _offer(transport, ("error", MCPError("MCP server 退出了（stdout 到 EOF）")))
+                return
+            _offer(transport, ("line", line))
+    except UnicodeDecodeError as exc:
+        _offer(transport, ("error", MCPError(f"MCP server 的协议通道不是 UTF-8：{exc}")))
+    except (OSError, ValueError) as exc:
+        _offer(transport, ("error", MCPError(f"MCP server 读取失败：{exc}")))
+
+
+def _writer_loop(transport: _Transport) -> None:
+    # A fixed writer also makes a full stdin pipe subject to the request deadline.
+    # Terminating the child during close releases a blocked pipe write.
+    while not transport.stopped.is_set():
+        try:
+            payload, done = transport.writes.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        error = None
+        try:
+            transport.process.stdin.write(payload)
+            transport.process.stdin.flush()
+        except (OSError, ValueError) as exc:
+            error = MCPError(f"MCP server 写入失败：{exc}")
+        done.put(error)
+        if error is not None:
+            return
+
+
+class StdioClient:
+    """Serialized stdio RPC with bounded queueing, writes and response waits."""
+
+    def __init__(self, command: list[str], *, cwd: Path | None = None, sandbox: bool = True,
+                 env_overrides: dict | None = None, timeout: float = DEFAULT_TIMEOUT):
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be positive and finite")
         self.command = command
         self.cwd = cwd
         self.sandbox = sandbox
+        self.env_overrides = dict(env_overrides or {})
+        if sandbox and any(key.upper() not in _ENV_ALLOWLIST | {"FINANCE_LEDGER_DATABASE_URL"}
+                           for key in self.env_overrides):
+            raise ValueError("MCP sandbox environment overrides must use the allowlist")
+        self.timeout = timeout
+        self._request_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._transport: _Transport | None = None
         self._process: subprocess.Popen | None = None
         self._next_id = 0
         self.server_info: dict = {}
         self.protocol_version: str = ""
 
-    # --- 生命周期 -------------------------------------------------------
-
     def start(self) -> "StdioClient":
-        if self._process is not None:
-            return self
-        try:
-            self._process = subprocess.Popen(
-                self.command,
-                cwd=str(self.cwd) if self.cwd else None,
-                env=_sandboxed_env() if self.sandbox else None,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                # 见模块 docstring：接管道而不读会死锁，所以让它直接继承。
-                stderr=None,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,
-            )
-        except OSError as exc:
-            raise MCPError(f"起不了 MCP server（{self.command}）：{exc}") from exc
+        with self._state_lock:
+            if self._transport is not None:
+                return self
+            try:
+                process = subprocess.Popen(
+                    self.command, cwd=str(self.cwd) if self.cwd else None,
+                    env={**(_sandboxed_env() if self.sandbox else os.environ), **self.env_overrides},
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+                    text=True, encoding="utf-8", bufsize=1,
+                )
+            except OSError as exc:
+                raise MCPError(f"起不了 MCP server（{self.command}）：{exc}") from exc
+            transport = _Transport(process)
+            transport.reader = threading.Thread(target=_reader_loop, args=(transport,),
+                                                name=f"mcp-reader-{process.pid}", daemon=True)
+            transport.writer = threading.Thread(target=_writer_loop, args=(transport,),
+                                                name=f"mcp-writer-{process.pid}", daemon=True)
+            self._transport = transport
+            self._process = process
+            transport.reader.start()
+            transport.writer.start()
         return self
 
-    def close(self) -> None:
-        if self._process is None:
-            return
-        try:
-            if self._process.stdin:
-                self._process.stdin.close()
-            self._process.wait(timeout=5)
-        except (OSError, subprocess.TimeoutExpired):
-            self._process.kill()
-        finally:
+    def _disconnect(self, expected: _Transport | None = None) -> None:
+        # Never wait for the request lock: close must interrupt an in-flight RPC.
+        with self._state_lock:
+            transport = self._transport
+            if transport is None or (expected is not None and transport is not expected):
+                return
+            self._transport = None
             self._process = None
+            transport.stopped.set()
+        process = transport.process
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=0.5)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                process.wait(timeout=1)
+        for thread in (transport.reader, transport.writer):
+            if thread is not None:
+                thread.join(timeout=1)
+        # Child exit unblocks pipe I/O before closing wrappers, avoiding the
+        # TextIOWrapper lock deadlock seen when another thread is in readline.
+        if transport.writer is None or not transport.writer.is_alive():
+            if process.stdin:
+                try:
+                    process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+        if transport.reader is None or not transport.reader.is_alive():
+            if process.stdout:
+                process.stdout.close()
+
+    def close(self) -> None:
+        self._disconnect()
 
     def __enter__(self) -> "StdioClient":
         return self.start()
@@ -96,68 +197,89 @@ class StdioClient:
     def __exit__(self, *exc_info) -> None:
         self.close()
 
-    # --- 协议 -----------------------------------------------------------
-
-    def _write(self, payload: dict) -> None:
-        if self._process is None or self._process.stdin is None:
-            raise MCPError("客户端还没启动")
-        self._process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        self._process.stdin.flush()
-
-    def _read_reply(self, request_id: int) -> dict:
-        """读到我们要的那条回复为止。
-
-        服务端可能**主动发通知**（比如日志），那些没有 id，要跳过 ——
-        不跳的话，第一条通知就会被当成「我们的回复」，然后解析失败。
-        """
-        assert self._process is not None and self._process.stdout is not None
-
+    def _wait(self, transport: _Transport, source: queue.Queue, deadline: float):
         while True:
+            if transport.stopped.is_set():
+                raise MCPError("MCP 连接已关闭")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise MCPError(f"MCP 请求超时（{self.timeout:g} 秒）")
             try:
-                line = self._process.stdout.readline()
-            except UnicodeDecodeError as exc:
-                # 对端没把自己的 stdout 编码钉死时就是这样：它按 locale 写
-                # （中文 Windows 上是 cp936），我们按 UTF-8 读。不拦这一下的话
-                # 报出来的是 UnicodeDecodeError，而真正的原因（协议通道的编码
-                # 不对）离它很远 —— 看起来像客户端坏了。
-                raise MCPError(
-                    "MCP server 写出来的不是 UTF-8，多半是它的 stdout 跟着系统 "
-                    f"locale 走了。协议通道必须是 UTF-8（服务器应在启动时 "
-                    f"reconfigure）。原始错误：{exc}"
-                ) from exc
-            if not line:
-                raise MCPError("MCP server 没打招呼就退出了（stdout 到 EOF）")
+                return source.get(timeout=min(remaining, 0.1))
+            except queue.Empty:
+                pass
 
+    def _write(self, transport: _Transport, payload: dict, deadline: float) -> None:
+        done = queue.Queue(maxsize=1)
+        wire = json.dumps(payload, ensure_ascii=False) + "\n"
+        try:
+            transport.writes.put((wire, done), timeout=max(0, deadline - time.monotonic()))
+        except queue.Full as exc:
+            raise MCPError("MCP 请求写入超时") from exc
+        error = self._wait(transport, done, deadline)
+        if error is not None:
+            raise error
+
+    def _read_reply(self, transport: _Transport, request_id: int, deadline: float) -> dict:
+        while True:
+            kind, value = self._wait(transport, transport.replies, deadline)
+            if kind == "error":
+                raise value
+            line = value
             try:
                 message = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise MCPError(f"MCP server 发来的不是 JSON：{line[:200]!r}") from exc
-
-            # 合法 JSON 不一定是合法的 **JSON-RPC 消息** —— `"hello"` 和 `42`
-            # 都能过 json.loads。不挡这一下的话，下面那行 `.get` 会抛
-            # AttributeError，而那个报错离真正的原因（服务端往协议通道里
-            # 写了非协议内容）很远。
             if not isinstance(message, dict):
                 raise MCPError(f"MCP server 发来的不是 JSON-RPC 对象：{line[:200]!r}")
-
             if message.get("id") != request_id:
                 continue
             if "error" in message:
                 error = message["error"]
+                if not isinstance(error, dict):
+                    raise MCPError("MCP server error 字段不是对象")
                 raise MCPError(f"服务端报错 {error.get('code')}：{error.get('message')}")
-            return message.get("result") or {}
+            result = message.get("result", {})
+            if not isinstance(result, dict):
+                raise MCPError("MCP server result 字段不是对象")
+            return result
+
+    def _exchange(self, method: str, params: dict | None, *, notify: bool = False):
+        deadline = time.monotonic() + self.timeout
+        if not self._request_lock.acquire(timeout=self.timeout):
+            raise MCPError(f"MCP 请求排队超时（{self.timeout:g} 秒）")
+        transport = None
+        try:
+            with self._state_lock:
+                transport = self._transport
+            if transport is None:
+                raise MCPError("客户端还没启动或已关闭")
+            payload = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+            if not notify:
+                self._next_id += 1
+                payload["id"] = self._next_id
+            try:
+                self._write(transport, payload, deadline)
+            except MCPError:
+                if notify or transport.stopped.is_set():
+                    raise
+                # A short-lived child may emit a protocol diagnostic before
+                # closing stdin. Preserve response order and parse that output.
+                return self._read_reply(transport, payload["id"], min(deadline, time.monotonic() + 0.2))
+            if not notify:
+                return self._read_reply(transport, payload["id"], deadline)
+        except MCPError:
+            if transport is not None:
+                self._disconnect(transport)
+            raise
+        finally:
+            self._request_lock.release()
 
     def request(self, method: str, params: dict | None = None) -> dict:
-        self._next_id += 1
-        request_id = self._next_id
-        self._write(
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
-        )
-        return self._read_reply(request_id)
+        return self._exchange(method, params)
 
     def notify(self, method: str, params: dict | None = None) -> None:
-        """通知：有 method 没有 id，服务端不该回。"""
-        self._write({"jsonrpc": "2.0", "method": method, "params": params or {}})
+        self._exchange(method, params, notify=True)
 
     # --- 三个高层动作（对应协议的三步）----------------------------------
 
@@ -227,12 +349,13 @@ def _sandboxed_env() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key.upper() in _ENV_ALLOWLIST}
 
 
-def ledger_client(command: list[str] | None = None, *, sandbox: bool = True) -> StdioClient:
+def ledger_client(command: list[str] | None = None, *, sandbox: bool = True, database_url: str | None = None) -> StdioClient:
     """起一个账单 server 客户端。"""
     return StdioClient(
         command or [sys.executable, str(LEDGER_SERVER)],
         cwd=PROJECT_ROOT,
         sandbox=sandbox,
+        env_overrides={"FINANCE_LEDGER_DATABASE_URL": database_url} if database_url else None,
     )
 
 

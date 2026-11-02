@@ -1,350 +1,386 @@
-"""Web 端的会话管理 —— 把 agent 的事件流转成可以推给浏览器的东西。
+"""Bounded Agent execution, durable checkpoints and resumable event delivery.
 
-## 权限确认怎么跨 HTTP 工作
-
-`correct_category` 会先问一句再改东西（Day 4 定的），而那个回调是**同步**的：
-它在 `session.send()` 里面被调用，必须当场返回一个 bool。
-
-浏览器那边却是异步的 —— 用户看到弹窗、想几秒、点一下，这中间隔着一次网络往返。
-
-所以这里用一条阻塞等待把两边接起来：
-
-    工具线程                          浏览器
-    ─────────                         ──────
-    confirm() 被调用
-      推一条 confirm_request 事件 ──▶  弹出确认框
-      event.wait(timeout=...)          …用户想几秒…
-      ◀──────────────────────────────  POST /confirm
-      返回 True/False
-
-**超时即拒绝。** 浏览器关掉了、网络断了、用户走开了 —— 这些情况下等待必须
-结束，而且必须结束在「不允许」那一侧。一个等不到答复就放行的实现，等于把
-确认这件事取消了。
-
-## 为什么服务器要留一份事件日志
-
-SSE 没有回放。刷新页面之后新连接是「从此刻起」的 —— 而 agent 可能已经跑了
-一半，那些步骤就永远看不到了。
-
-所以每个会话留一份事件日志，新连接**先回放再续播**。这同时也是「刷新页面
-历史还在」的实现方式，不需要客户端自己存。
-
-日志是有上限的：一个跑了几十轮的会话能攒下几兆的事件，而其中绝大部分不会
-再被看。超了就丢最老的。
+With SessionStore, the database is authoritative. Bounded listener queues only
+wake readers; slow browsers catch up from their last delivered sequence.
 """
+from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+import json
 import queue
 import secrets
 import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any
 
+from langchain_core.messages import messages_from_dict, messages_to_dict
 from fa.agent import Session
 from fa.events import TOOL_RESULT
 from web.charts import extract_series
 
-# 这个也是**传输层**的事件：agent 不知道有图表这回事，是服务器从工具结果里
-# 认出分组表之后补推的。见 `_record` 上面那段说明。
 CHART = "chart"
-
-# 这两个是**传输层**的事件，不是 agent 发的 —— agent 只负责 `step_start` /
-# `tool_call` / ... 那几个（见 fa/events.py）。
-#
-# 服务器需要它们，是因为浏览器要知道「这一轮什么时候结束」才能把输入框
-# 重新启用。agent 的 `answer` / `error` 事件虽然也标志着结束，但那是 agent
-# 的语义，而这里是传输的语义 —— 一轮可能因为异常没有那两个事件。
 TURN_START = "turn_start"
 TURN_END = "turn_end"
-
 CONFIRM_REQUEST = "confirm_request"
-
-# 确认框最多等 5 分钟。等不到就当用户拒绝。
 CONFIRM_TIMEOUT = 300.0
-
-# 心跳间隔。中间有代理时，长时间没有字节的 SSE 连接会被掐掉 ——
-# 而 agent 跑一轮可能要几十秒，中间一直在调工具、没有给浏览器发过东西。
 HEARTBEAT_SECONDS = 15.0
-
-# 每个会话最多留多少条事件。超了丢最老的。
 MAX_EVENTS = 2000
-
-# 同时最多开多少个会话。有写权限的 agent 不能让人随便开。
 MAX_SESSIONS = 50
 
 
-def _iso(stamp: float) -> str:
-    """时间戳 → ISO 字符串。浏览器 `new Date(...)` 直接能解。
+class SessionBusy(RuntimeError):
+    pass
 
-    用**本地时间**而不是 UTC：这个列表是给人看的，`fromtimestamp` 出的是本机
-    时区。要给机器比对才需要 UTC。
-    """
+
+class ExecutionQueueFull(RuntimeError):
+    pass
+
+
+class ManagerClosed(RuntimeError):
+    pass
+
+
+def _iso(stamp):
     return datetime.fromtimestamp(stamp).isoformat(timespec="seconds")
 
 
 class LiveSession:
-    """一个浏览器会话对着一个 agent Session。
-
-    故意写成普通类而不是 dataclass：`Session` 的构造需要 `confirm` 回调，而那个
-    回调要绑在**这个对象**上。dataclass 的字段在 `__init__` 里依次赋值，拿不到
-    「已经构造了一半的 self」；普通类里 `self.ask` 在构造时随手就有。
-    """
-
-    def __init__(self, session_id: str, *, confirm: bool = True):
+    def __init__(self, session_id, *, confirm=True, store=None, session_factory=None, snapshot=None):
         self.id = session_id
         self.lock = threading.Lock()
-        self.events: list[dict] = []
-        self.listeners: list[queue.Queue] = []
+        self.events = []
+        self.listeners = []
+        self.store = store
+        self.closed = False
         self.busy = False
-
-        # 会话列表要用的元数据。**没有它，浏览器就只能自己记一个 id** ——
-        # 而 id 一丢（刷新、换标签页、换设备）那个会话就再也找不回来了，
-        # 尽管服务端的回放明明还在，却没有任何入口能走回去。
         self.created_at = time.time()
         self.last_activity = self.created_at
         self.turns = 0
-
-        self._pending: threading.Event | None = None
+        self._seq = 0
+        self._pending = None
+        self._confirmation_id = None
         self._answer = False
+        self._answered = False
+        self._stop_requested = False
+        if snapshot:
+            for name in ("created_at", "last_activity", "turns", "busy"):
+                setattr(self, name, snapshot[name])
+            self._seq = snapshot["next_seq"]
+        factory = session_factory or (lambda confirm, on_event: Session(confirm=confirm, on_event=on_event))
+        self.session = factory(self.ask if confirm else None, self.emit)
+        if snapshot and snapshot.get("messages"):
+            self.session.messages = messages_from_dict(snapshot["messages"])
 
-        # `on_event` 必须在这里接上。忘了接的话 agent 照常跑，但所有事件
-        # （step_start / tool_call / tool_result / answer）全部丢进虚空 ——
-        # 浏览器只看得到 turn_start 和 turn_end：界面一片空白，而**没有任何
-        # 报错**。这是那种「看起来像前端坏了、其实是后端没接线」的问题。
-        self.session = Session(
-            confirm=self.ask if confirm else None,
-            on_event=self.emit,
-        )
-
-    # --- 事件播报 -------------------------------------------------------
-
-    def emit(self, event: dict) -> None:
-        """记进日志 + 推给所有打开的连接。
-
-        这个方法是从**工具线程**里被调的（agent 的 `on_event`），所以日志和
-        监听器列表都要加锁。
-        """
+    def emit(self, event):
         self._record(event)
-
-        # 工具结果里如果是一张分组表，顺手再推一份**结构化**的数据给前端画图。
-        #
-        # 放在服务端做而不是让前端解字符串，是为了让 agent 和工具层完全不用知道
-        # 「有前端这回事」—— 它们照旧只返回给模型看的文本。也放在服务端而不是
-        # 前端，是因为解析这件事要有测试钉住（见 web/charts.py），而前端的代码
-        # 在这个项目里没有测试。
         if event.get("type") == TOOL_RESULT:
             series = extract_series(event.get("content", ""))
             if series:
                 self._record({"type": CHART, "call_id": event.get("call_id"), **series})
 
-    def _record(self, event: dict) -> None:
+    def _cache_and_notify(self, event):
         with self.lock:
+            if self.closed:
+                return
             self.events.append(event)
-            if len(self.events) > MAX_EVENTS:
-                del self.events[: len(self.events) - MAX_EVENTS]
+            del self.events[:-MAX_EVENTS]
+            self._seq = event.get("seq", self._seq)
             self.last_activity = time.time()
-            listeners = list(self.listeners)
+            # Same lock as subscription keeps in-memory replay before live events.
+            for listener in self.listeners:
+                try:
+                    listener.put_nowait(None if self.store else event)
+                except queue.Full:
+                    pass
 
-        for listener in listeners:
-            listener.put(event)
+    def _record(self, event):
+        if self.store:
+            payload = self.store.append(self.id, event)
+            if payload is not None:
+                self._cache_and_notify(payload)
+        else:
+            self._cache_and_notify(event)
 
-    def subscribe(self) -> queue.Queue:
-        """打开一条新连接。**先拿到回放，再加入监听**。
-
-        顺序反了的话，两步之间产生的事件会既不在回放里、也没推过来 ——
-        表现为「刷新之后少了一步」，而且只在时间凑巧时出现（间歇性 bug）。
-        """
+    def subscribe(self, after_seq=0):
+        if after_seq < 0:
+            raise ValueError("after_seq must be nonnegative")
         with self.lock:
-            backlog = list(self.events)
-            listener: queue.Queue = queue.Queue()
-            self.listeners.append(listener)
+            listener = queue.Queue(maxsize=1 if self.store else 0)
+            if not self.store:
+                for event in self.events:
+                    if not event.get("seq") or event["seq"] > after_seq:
+                        listener.put_nowait(event)
+            if self.closed:
+                listener.put_nowait(None)
+            else:
+                self.listeners.append(listener)
+            return listener
 
-        for event in backlog:
-            listener.put(event)
-        return listener
-
-    def unsubscribe(self, listener: queue.Queue) -> None:
+    def unsubscribe(self, listener):
         with self.lock:
             if listener in self.listeners:
                 self.listeners.remove(listener)
 
-    def summary(self) -> dict:
-        """会话列表里的一行。**不含对话内容** —— 列表只需要知道「有这么个
-        会话、什么时候动过」，正文要靠连上去回放。"""
+    def summary(self):
+        if self.store:
+            row = self.store.get(self.id)
+            if row:
+                return {"id": self.id, "created_at": _iso(row["created_at"]),
+                        "last_activity": _iso(row["last_activity"]), "turns": row["turns"],
+                        "busy": row["busy"], "events": row["next_seq"]}
         with self.lock:
-            return {
-                "id": self.id,
-                "created_at": _iso(self.created_at),
-                "last_activity": _iso(self.last_activity),
-                "turns": self.turns,
-                "busy": self.busy,
-                "events": len(self.events),
-            }
+            return {"id": self.id, "created_at": _iso(self.created_at),
+                    "last_activity": _iso(self.last_activity), "turns": self.turns,
+                    "busy": self.busy, "events": len(self.events)}
 
-    # --- 权限确认 -------------------------------------------------------
-
-    def ask(self, summary: str) -> bool:
-        """工具线程在这里停下来等浏览器回答。超时即拒绝。"""
+    def ask(self, summary):
         pending = threading.Event()
+        confirmation_id = secrets.token_urlsafe(16)
         with self.lock:
+            if self.closed:
+                return False
             self._pending = pending
+            self._confirmation_id = confirmation_id
             self._answer = False
-
-        self.emit({"type": CONFIRM_REQUEST, "summary": summary})
-
-        if not pending.wait(timeout=CONFIRM_TIMEOUT):
-            # 见模块 docstring：等不到答复必须落在「不允许」那一侧。
-            self.emit(
-                {
-                    "type": "confirm_timeout",
-                    "summary": summary,
-                    "message": f"等了 {int(CONFIRM_TIMEOUT)} 秒没有答复，按拒绝处理。",
-                }
-            )
-            with self.lock:
-                self._pending = None
-            return False
-
+            self._answered = False
+        self.emit({"type": CONFIRM_REQUEST, "summary": summary, "confirmation_id": confirmation_id})
+        received = pending.wait(timeout=CONFIRM_TIMEOUT)
         with self.lock:
-            answer = self._answer
-            self._pending = None
+            answer = bool(received and self._answer)
+            if self._pending is pending:
+                self._pending = None
+                self._confirmation_id = None
+        if not received:
+            self.emit({"type": "confirm_timeout", "summary": summary,
+                       "confirmation_id": confirmation_id,
+                       "message": f"等了 {int(CONFIRM_TIMEOUT)} 秒没有答复，按拒绝处理。"})
+        self.emit({"type": "confirm_resolved", "confirmation_id": confirmation_id,
+                   "allow": answer, "reason": "answered" if received else "timeout"})
         return answer
 
-    def answer(self, allow: bool) -> bool:
-        """浏览器点了按钮。返回是否真的有人等着。"""
+    def answer(self, allow, confirmation_id=None):
         with self.lock:
-            pending = self._pending
-            self._answer = allow
-        if pending is None:
-            return False
-        pending.set()
-        return True
-
-    def stop(self) -> bool:
-        """请求停掉正在跑的那一轮。返回「当时确实有一轮在跑」。
-
-        只是**转发**给 agent 的 `Session.stop()` —— 只有那里知道怎么安全地停
-        （见它的说明：模型调用拦不住，所以会停在当前这一步之后）。
-
-        判 `busy` 和转发之间有缝：这一轮可能正好在这中间跑完。后果是往一个已经
-        空闲的会话上设了停止信号，而下一次 `send()` 开头会清掉它 —— 无害，
-        不值得为它加锁把两个线程串起来。
-        """
-        with self.lock:
-            if not self.busy:
+            if (self._pending is None or self._answered or self.closed
+                    or (confirmation_id is not None and confirmation_id != self._confirmation_id)):
                 return False
+            self._answer = bool(allow)
+            self._answered = True
+            self._pending.set()
+            return True
+
+    def _deny_pending(self):
+        with self.lock:
+            if self._pending:
+                self._answer = False
+                self._answered = True
+                self._pending.set()
+
+    def stop(self):
+        with self.lock:
+            running = self.busy
+            if running:
+                self._stop_requested = True
+        if not running:
+            return False
+        self._deny_pending()
         self.session.stop()
         return True
 
-    # --- 跑一轮 ---------------------------------------------------------
-
-    def run(self, text: str) -> None:
-        """在后台线程里跑一轮。做完一定发 `turn_end` —— 哪怕炸了。
-
-        不发的话浏览器的输入框会永远禁用着，而用户完全不知道发生了什么。
-        """
+    def run(self, text):
         with self.lock:
+            if self.closed:
+                if self.store:
+                    self.store.release(self.id)
+                return
+            self.busy = True
             self.turns += 1
-        self.emit({"type": TURN_START, "text": text})
+        checkpoint = None
+        before = list(getattr(self.session, "messages", []))
         try:
-            self.session.send(text)
-        except Exception as exc:  # noqa: BLE001 - 一定要把状态机推回可用
+            if self.store:
+                self.store.started(self.id)
+            self.emit({"type": TURN_START, "text": text})
+            with self.lock:
+                stopped = self._stop_requested
+            if stopped:
+                self.emit({"type": "stopped", "text": "已停止，这一轮尚未执行。"})
+            else:
+                self.session.send(text)
+            checkpoint = messages_to_dict(getattr(self.session, "messages", []))
+        except Exception as exc:
+            if hasattr(self.session, "messages"):
+                self.session.messages = before
             self.emit({"type": "error", "message": f"这一轮崩了：{exc}"})
         finally:
-            with self.lock:
-                self.busy = False
-            self.emit({"type": TURN_END})
+            self._deny_pending()
+            # Checkpoint, busy release and end event are one DB transaction.
+            try:
+                if self.store:
+                    payload = self.store.finish(self.id, checkpoint)
+                    if payload is not None:
+                        self._cache_and_notify(payload)
+                else:
+                    self.emit({"type": TURN_END})
+            finally:
+                with self.lock:
+                    self.busy = False
 
 
 class SessionManager:
-    """一堆 LiveSession。有上限，因为每个会话都可能改文件。"""
-
-    def __init__(self, *, confirm: bool = True):
-        self._sessions: dict[str, LiveSession] = {}
-        self._lock = threading.Lock()
+    def __init__(self, *, confirm=True, store=None, session_factory=None,
+                 max_workers=2, max_pending=8, recover_interrupted=True):
+        if max_workers < 1 or max_pending < 0:
+            raise ValueError("invalid worker capacity")
+        self._sessions = {}
+        self._lock = threading.RLock()
         self._confirm = confirm
+        self.store = store
+        self._factory = session_factory
+        self._closed = False
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="finance-turn")
+        self._slots = threading.BoundedSemaphore(max_workers + max_pending)
+        if self.store and recover_interrupted:
+            self.store.recover_interrupted()
 
-    def create(self) -> LiveSession:
+    def _live(self, session_id, snapshot=None):
+        return LiveSession(session_id, confirm=self._confirm, store=self.store,
+                           session_factory=self._factory, snapshot=snapshot)
+
+    def create(self):
         with self._lock:
-            if len(self._sessions) >= MAX_SESSIONS:
-                raise RuntimeError(
-                    f"会话数到上限了（{MAX_SESSIONS}）。先关掉几个再开新的。"
-                )
-            live = LiveSession(secrets.token_urlsafe(12), confirm=self._confirm)
+            if self._closed:
+                raise ManagerClosed("服务正在关闭")
+            count = self.store.count() if self.store else len(self._sessions)
+            if count >= MAX_SESSIONS:
+                raise RuntimeError(f"会话数到上限了（{MAX_SESSIONS}）。先关掉几个再开新的。")
+            session_id = secrets.token_urlsafe(12)
+            snapshot = self.store.create(session_id) if self.store else None
+            try:
+                live = self._live(session_id, snapshot)
+            except Exception:
+                if self.store:
+                    self.store.delete(session_id)
+                raise
             self._sessions[live.id] = live
-        return live
+            return live
 
-    def get(self, session_id: str) -> LiveSession | None:
+    def get(self, session_id):
         with self._lock:
-            return self._sessions.get(session_id)
+            live = self._sessions.get(session_id)
+            if live is None and self.store:
+                snapshot = self.store.get(session_id)
+                if snapshot:
+                    live = self._live(session_id, snapshot)
+                    self._sessions[session_id] = live
+            return live
 
-    def list(self) -> list[LiveSession]:
-        """所有会话，最近活动的在前。
-
-        先复制再排序：排序要读每个会话的 `last_activity`，不该在握着 manager
-        的锁时去做（那会把所有请求串起来）。
-        """
+    def list(self):
+        if self.store:
+            return [live for row in self.store.list() if (live := self.get(row["id"])) is not None]
         with self._lock:
             items = list(self._sessions.values())
-        items.sort(key=lambda live: live.last_activity, reverse=True)
-        return items
+        return sorted(items, key=lambda live: live.last_activity, reverse=True)
 
-    def drop(self, session_id: str) -> None:
+    def submit(self, live, text):
         with self._lock:
-            self._sessions.pop(session_id, None)
+            if self._closed:
+                raise ManagerClosed("服务正在关闭")
+            if self._sessions.get(live.id) is not live or live.closed:
+                raise ManagerClosed("会话已关闭")
+            if not self._slots.acquire(blocking=False):
+                raise ExecutionQueueFull("任务队列已满，请稍后重试")
+            claimed = False
+            try:
+                with live.lock:
+                    if live.busy or (self.store and not self.store.claim(live.id)):
+                        raise SessionBusy("上一轮还没跑完")
+                    live.busy = True
+                    live._stop_requested = False
+                    claimed = True
+                future = self._executor.submit(live.run, text)
+            except Exception:
+                if claimed:
+                    with live.lock:
+                        live.busy = False
+                    if self.store:
+                        self.store.release(live.id)
+                self._slots.release()
+                raise
+            future.add_done_callback(lambda _: self._slots.release())
+            return future
 
-    def close(self, session_id: str) -> bool:
-        """关掉一个会话。返回「关的时候它还在跑」。
+    def drop(self, session_id):
+        with self._lock:
+            live = self._sessions.pop(session_id, None)
+            if live:
+                with live.lock:
+                    live.closed = True
+                    for listener in live.listeners:
+                        try:
+                            listener.put_nowait(None)
+                        except queue.Full:
+                            pass
+            if self.store:
+                self.store.delete(session_id)
 
-        **先停再摘。** 不先停的话，那一轮会**没人看着继续跑完**：每次工具调用和
-        模型往返都是真调用，而结果发进一个已经没有订阅者的对象。停是尽力而为的
-        （模型调用拦不住，见 `fa/agent.py` 的 `Session.stop`），但至少不会让剩下
-        的工具接着跑。
+    def close(self, session_id):
+        # Serialize stop + removal with submit. Otherwise an idle session could
+        # accept a new turn in the gap after stop() and run after being closed.
+        with self._lock:
+            live = self.get(session_id)
+            if live is None:
+                return False
+            running = live.stop()
+            live._deny_pending()
+            self.drop(session_id)
+            return running
 
-        摘掉的只是这个 `LiveSession`。已经落盘的东西（分类缓存、长期记忆）是
-        **所有会话共用**的，不归它，所以也不会跟着没。
-        """
-        live = self.get(session_id)
-        if live is None:
-            return False
-        running = live.stop()
-        self.drop(session_id)
-        return running
-
-    def count(self) -> int:
+    def count(self):
+        if self.store:
+            return self.store.count()
         with self._lock:
             return len(self._sessions)
 
+    def shutdown(self, wait=True):
+        with self._lock:
+            self._closed = True
+            items = list(self._sessions.values())
+        for live in items:
+            live.stop()
+            live._deny_pending()
+        # Drain queued turns so durable claims are cleared.
+        self._executor.shutdown(wait=wait, cancel_futures=False)
 
-def stream(live: LiveSession, listener: queue.Queue):
-    """把一条监听队列变成 SSE 的字节流。
 
-    心跳是必要的，不是装饰：中间有代理时，长时间没有字节的连接会被掐掉 ——
-    而 agent 跑一轮要几十秒，中间一直在调工具、没给浏览器发过任何东西。
-    没有心跳的话，用户看到的是「跑到一半连接断了」。
-    """
+def stream(live, listener, after_seq=0):
+    if after_seq < 0:
+        raise ValueError("after_seq must be nonnegative")
+    cursor = after_seq
     try:
         yield _sse({"type": "connected", "session": live.id})
-        while True:
+        while not live.closed:
+            if live.store:
+                batch = live.store.events_after(live.id, cursor)
+                if batch:
+                    for event in batch:
+                        cursor = event["seq"]
+                        yield _sse(event)
+                    continue
             try:
                 event = listener.get(timeout=HEARTBEAT_SECONDS)
             except queue.Empty:
-                # 注释行：SSE 规范里以 `:` 开头的行会被客户端忽略，
-                # 但它**是字节**，足够让中间那些东西认为连接还活着。
                 yield ": 心跳\n\n"
                 continue
-            yield _sse(event)
+            if not live.store and event is not None:
+                yield _sse(event)
     finally:
         live.unsubscribe(listener)
 
 
-def _sse(payload: dict) -> str:
-    """一个 SSE 帧。"""
-    import json
-
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+def _sse(payload):
+    prefix = f"id: {payload['seq']}\n" if "seq" in payload else ""
+    return f"{prefix}data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def now() -> float:
+def now():
     return time.time()

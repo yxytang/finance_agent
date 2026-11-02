@@ -10,11 +10,17 @@ __pycache__/
 
 # 真 key 放这里，绝不提交
 .env
+.env.*
+!.env.docker.example
 
 # 运行时产物：分类缓存、BM25 索引、跨会话记忆都落在这几个目录。
 # 它们由代码生成、可以重建，而且记忆里可能有用户的私人内容。
 data/category_cache.json
 knowledge/.index/
+# 用户上传的原始资料，可能包含个人财务信息。
+knowledge/uploads/
+# 模拟资料的生成中间文件和渲染预览；最终PDF/PPTX/图片仍可提交。
+output/demo_knowledge/_qa/
 memory/*.md
 
 # 注意：data/transactions.csv 和 data/reference.csv **要提交**。
@@ -28,3 +34,8 @@ eval/runs/
 
 # 本地开发用的启动配置（里面有本机的 venv 绝对路径）
 .claude/
+
+# 后端数据库、上传暂存、便携测试运行时（不含可提交的示例 CSV）
+data/backend.sqlite3*
+data/backend_jobs/
+.runtime/

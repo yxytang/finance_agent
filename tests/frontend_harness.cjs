@@ -79,6 +79,45 @@ function setup() {
   return { nodes, requests, context, run };
 }
 
+test('knowledge upload sends original file with auth and prevents double submission', async () => {
+  const { nodes, context, run, requests } = setup();
+  const file = { name: '预算 资料.pdf', size: 120 };
+  nodes['knowledge-files'].files = [file];
+  let release;
+  context.fetch = (url, options = {}) => {
+    requests.push({ url: String(url), options });
+    if (options.method === 'POST') return new Promise(resolve => { release = resolve; });
+    if (String(url).includes('/api/jobs/')) return Promise.resolve({ ok: true, json: async () => ({ status: 'succeeded', result: { methods: ['ocr'] } }) });
+    return Promise.resolve({ ok: true, json: async () => ({ files: [], indexed: true }) });
+  };
+  const pending = run('uploadKnowledge()');
+  await run('uploadKnowledge()');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].options.body, file);
+  assert.match(requests[0].url, /token=test-token/);
+  assert.match(requests[0].url, /%E9%A2%84/);
+  assert.equal(nodes['knowledge-upload'].disabled, true);
+  release({ ok: true, json: async () => ({ id: 'job-1', status: 'queued' }) });
+  await pending;
+  assert.match(nodes['knowledge-progress'].textContent, /已入库/);
+  assert.match(nodes['knowledge-progress'].textContent, /核对数字/);
+  assert.equal(nodes['knowledge-upload'].disabled, false);
+});
+
+test('knowledge batch retains parse errors and continues valid files', async () => {
+  const { nodes, context, run } = setup();
+  nodes['knowledge-files'].files = [{ name: 'bad.pdf', size: 5 }, { name: 'good.pdf', size: 5 }];
+  context.fetch = async (url, options = {}) => {
+    if (String(url).includes('/api/jobs/')) return { ok: true, json: async () => ({ status: 'succeeded', result: { methods: ['native'] } }) };
+    if (options.method !== 'POST') return { ok: true, json: async () => ({ files: [] }) };
+    if (String(url).includes('bad.pdf')) return { ok: false, json: async () => ({ detail: '文件损坏' }) };
+    return { ok: true, json: async () => ({ id: 'job-2', status: 'queued' }) };
+  };
+  await run('uploadKnowledge()');
+  assert.match(nodes['knowledge-progress'].textContent, /bad.pdf：文件损坏/);
+  assert.match(nodes['knowledge-progress'].textContent, /good.pdf 已入库/);
+});
+
 test('final answer keeps tool evidence and chart DOM attached', () => {
   const { run, nodes } = setup();
   run('render({type: "turn_start", text: "看看消费"})');
@@ -170,4 +209,42 @@ test('switching sessions destroys charts and dismisses the old confirmation', as
   assert.equal(destroyed, 1);
   await run('answer(true)');
   assert.equal(requests.length, 0);
+});
+
+test('SSE reconnect ignores delivered sequence IDs and fresh view replays history', () => {
+  const { run, nodes } = setup();
+  run('connect(); source.onmessage({lastEventId:"1",data:JSON.stringify({type:"turn_start",text:"核对账单",seq:1})})');
+  const count = nodes.log.children.length;
+  run('source.onmessage({lastEventId:"1",data:JSON.stringify({type:"turn_start",text:"核对账单",seq:1})})');
+  assert.equal(nodes.log.children.length, count);
+  run('source.onmessage({lastEventId:"2",data:JSON.stringify({type:"answer",text:"金额10",seq:2})})');
+  const actions = nodes.log.querySelectorAll('.answer-actions').length;
+  run('source.onmessage({lastEventId:"2",data:JSON.stringify({type:"answer",text:"金额10",seq:2})})');
+  assert.equal(nodes.log.querySelectorAll('.answer-actions').length, actions);
+  run('openSession("other"); source.onmessage({lastEventId:"1",data:JSON.stringify({type:"turn_start",text:"历史消息",seq:1})})');
+  assert.equal(nodes.log.querySelector('.user').textContent, '历史消息');
+});
+
+test('confirmation submits its ID and stale resolution cannot close newer dialog', async () => {
+  const { run, nodes, requests } = setup();
+  run('render({type:"confirm_request",summary:"确认分类",confirmation_id:"current"})');
+  run('render({type:"confirm_resolved",confirmation_id:"old"})');
+  assert.equal(nodes.confirm.open, true);
+  await run('answer(true)');
+  assert.deepEqual(JSON.parse(requests[0].options.body), { allow: true, confirmation_id: 'current' });
+  run('render({type:"confirm_request",summary:"确认分类",confirmation_id:"next"}); render({type:"confirm_resolved",confirmation_id:"next"})');
+  assert.equal(nodes.confirm.open, false);
+});
+
+test('background upload polls state and preserves task ID on connection failure', async () => {
+  const { run, nodes, context } = setup();
+  const storage = new Map();
+  context.localStorage = { getItem: k => storage.get(k) || null, setItem: (k,v) => storage.set(k,v) };
+  context.fetch = async () => { throw new Error('连接中断'); };
+  await assert.rejects(run('waitForKnowledgeJob({id:"pending-job"})'), /连接中断/);
+  assert.deepEqual(JSON.parse(storage.get('fa.document-jobs')), ['pending-job']);
+  context.fetch = async () => ({ ok: true, json: async () => ({ status:'succeeded', result:{chunks:3} }) });
+  assert.equal((await run('waitForKnowledgeJob({id:"pending-job"})')).chunks, 3);
+  assert.deepEqual(JSON.parse(storage.get('fa.document-jobs')), []);
+  assert.equal(nodes['knowledge-cancel'].hidden, true);
 });

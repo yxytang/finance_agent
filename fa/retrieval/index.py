@@ -32,6 +32,7 @@ import hashlib
 import json
 import math
 import re
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -235,16 +236,23 @@ def save(index: SearchIndex, path: Path) -> None:
     payload = {
         "fingerprint": index.fingerprint,
         "chunks": [
-            {"source": c.source, "breadcrumb": c.breadcrumb, "text": c.text}
+            {"source": c.source, "breadcrumb": c.breadcrumb, "text": c.text,
+             **({"page": c.page} if c.page is not None else {}),
+             **({"slide": c.slide} if c.slide is not None else {}),
+             **({"extraction_method": c.extraction_method} if c.extraction_method else {})}
             for c in index.chunks
         ],
         "title": {"lengths": index.title.lengths, "postings": index.title.postings},
         "body": {"lengths": index.body.lengths, "postings": index.body.postings},
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-    )
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        json.dump(payload, handle, ensure_ascii=False)
+    try:
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def load(path: Path) -> SearchIndex:
@@ -295,8 +303,14 @@ def corpus_fingerprint(root: Path) -> str:
 
     真要优化的话，该优化的是调用方（别每次查询都重算），而不是把正确性换掉。
     """
+    from fa.retrieval.documents import parser_signature, source_files
+
     digest = hashlib.sha1(SCHEME.encode("utf-8"))
-    for path in sorted(root.rglob("*.md")):
+    paths = source_files(root)
+    # 纯Markdown语料保持历史指纹；非MD增加解析器/OCR配置版本。
+    if any(p.suffix.lower() != ".md" for p in paths):
+        digest.update(parser_signature().encode("utf-8"))
+    for path in paths:
         try:
             content = path.read_bytes()
         except OSError:

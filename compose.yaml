@@ -1,0 +1,94 @@
+x-finance-environment: &backend-env
+  # Passwords are URL-encoded by backend.container, not interpolated in a URL.
+  FINANCE_DB_HOST: postgres
+  FINANCE_DB_PORT: "5432"
+  FINANCE_DB_USER: finance
+  FINANCE_DB_NAME: finance
+  FINANCE_DB_PASSWORD: ${FINANCE_DB_PASSWORD:?Set FINANCE_DB_PASSWORD in your shell or .env}
+  FINANCE_AUTO_CREATE_SCHEMA: "0"
+  FINANCE_DOCUMENT_WORKER: external
+  FINANCE_JOB_STAGING_DIR: /app/data/backend_jobs
+  KNOWLEDGE_OCR_MODE: ${KNOWLEDGE_OCR_MODE:-auto}
+
+x-finance-application: &application
+  image: ${FINANCE_IMAGE:-finance-agent:local}
+  build:
+    context: .
+  init: true
+  stop_grace_period: 90s
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: finance
+      POSTGRES_DB: finance
+      POSTGRES_PASSWORD: ${FINANCE_DB_PASSWORD:?Set FINANCE_DB_PASSWORD in your shell or .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finance -d finance"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+  migrate:
+    <<: *application
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  api:
+    <<: *application
+    restart: unless-stopped
+    # Session recovery and pending confirmations require one API process.
+    ports: ["127.0.0.1:${FINANCE_HTTP_PORT:-8000}:8000"]
+    environment:
+      <<: *backend-env
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      RAG_API_KEY: ${RAG_API_KEY:-}
+      RAG_EMBED_BASE_URL: ${RAG_EMBED_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      RAG_EMBED_MODEL: ${RAG_EMBED_MODEL:-text-embedding-v4}
+      # '-' preserves explicit blank values, which disable reranking.
+      RAG_RERANK_BASE_URL: ${RAG_RERANK_BASE_URL-https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank}
+      RAG_RERANK_MODEL: ${RAG_RERANK_MODEL-gte-rerank-v2}
+      REDIS_URL: ${REDIS_URL:-}
+      FINANCE_WEB_TOKEN: ${FINANCE_WEB_TOKEN:-}
+    volumes:
+      - backend_files:/app/data/backend_jobs
+      - knowledge_files:/app/knowledge
+      - agent_memory:/app/memory
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)); assert r.get('ok') and r.get('persistence')"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+  worker:
+    <<: *application
+    restart: unless-stopped
+    command: ["python", "-m", "backend.worker", "--concurrency", "2"]
+    environment: *backend-env
+    volumes:
+      - backend_files:/app/data/backend_jobs
+      - knowledge_files:/app/knowledge
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+volumes:
+  postgres_data:
+  backend_files:
+  knowledge_files:
+  agent_memory:

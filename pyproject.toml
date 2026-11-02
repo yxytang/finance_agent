@@ -2,10 +2,11 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-# 只打包 fa —— data/ 是脚本目录（`python -m data.generate`），不是要装的东西。
-# 测试从仓库根跑，靠下面的 pythonpath 找到它。
-[tool.setuptools]
-packages = ["fa", "fa.tools"]
+[tool.setuptools.packages.find]
+include = ["fa*", "web*", "backend*", "mcp_server*"]
+
+[tool.setuptools.package-data]
+web = ["index.html"]
 
 [project]
 name = "finance-agent"
@@ -40,6 +41,20 @@ eval = [
 web = [
     "fastapi",
     "uvicorn",
+    "SQLAlchemy>=2.0,<3",
+    "alembic>=1.13,<2",
+    "psycopg[binary]>=3.1,<4",
+]
+# Kafka workers are explicit opt-in; ordinary API/CLI startup never needs a broker.
+kafka = [
+    "confluent-kafka>=2.6,<3",
+]
+# PDF/PPTX解析及本地中英文OCR；不需要云端视觉API或独立OCR服务。
+documents = [
+    "PyMuPDF>=1.24",
+    "python-pptx>=1.0",
+    "Pillow>=10.1",
+    "rapidocr-onnxruntime>=1.4.4,<2",
 ]
 # 第十一天的向量检索单独列 —— **chromadb 不能进 base `dependencies`。**
 #

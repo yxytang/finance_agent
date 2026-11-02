@@ -107,6 +107,10 @@ def build_model(cls=ChatOpenAI, **kwargs) -> ChatOpenAI:
     if not api_key:
         raise RuntimeError(f"没找到 DEEPSEEK_API_KEY，请填进 {ENV_FILE}")
 
+    # Only the SDK retries the remote model request. Never retry the whole turn:
+    # its previous steps may already have committed financial/category writes.
+    kwargs.setdefault("max_retries", 1)
+
     return cls(
         model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
         base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),

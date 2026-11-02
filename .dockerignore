@@ -1,0 +1,31 @@
+# Build context allowlist: no local databases, uploaded bills, secrets or tools.
+**
+!pyproject.toml
+!README.md
+!fa/
+!fa/**
+!web/
+!web/**
+!backend/
+!backend/**
+!mcp_server/
+!mcp_server/**
+!alembic.ini
+!alembic/
+!alembic/**
+!data/
+!data/transactions.csv
+!knowledge/
+!knowledge/*.md
+!skills/
+!skills/**
+
+# Keep exclusions last so package-local development files cannot re-enter.
+**/__pycache__
+**/*.pyc
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+knowledge/.index
+knowledge/uploads

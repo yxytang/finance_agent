@@ -51,6 +51,9 @@ class Chunk:
     source: str  # 相对 knowledge/ 的路径
     breadcrumb: str  # "个税基础 > 专项附加扣除 > 住房贷款利息"
     text: str  # 正文（不含标题行）
+    page: int | None = None
+    slide: int | None = None
+    extraction_method: str = ""
 
     @property
     def title(self) -> str:
@@ -154,11 +157,26 @@ def load_corpus(root: Path) -> list[Chunk]:
     if not root.is_dir():
         return []
 
+    from fa.retrieval.documents import DocumentError, extract_document, source_files
+
     chunks: list[Chunk] = []
-    for path in sorted(root.rglob("*.md")):
+    for path in source_files(root):
+        source = path.relative_to(root).as_posix()
+        if path.suffix.lower() != ".md":
+            try:
+                parts = extract_document(path, root / ".index" / "extracted")
+            except DocumentError as exc:
+                raise DocumentError(f"{source}：{exc}") from exc
+            for part in parts:
+                for i, piece in enumerate(_split_long(part.text.strip())):
+                    if piece.strip():
+                        breadcrumb = f"{source} > {part.location}" + (f" {CONTINUED}" if i else "")
+                        chunks.append(Chunk(source, breadcrumb, piece, page=part.page,
+                                            slide=part.slide, extraction_method=part.method))
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        chunks.extend(chunk_markdown(text, path.relative_to(root).as_posix()))
+        chunks.extend(chunk_markdown(text, source))
     return chunks

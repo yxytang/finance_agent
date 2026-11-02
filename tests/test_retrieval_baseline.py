@@ -23,8 +23,9 @@ fixture）。故意如此：要钉住的正是「词法那两路在真语料上�
 
 import pytest
 
-from fa.config import KNOWLEDGE_DIR, KNOWLEDGE_INDEX
-from fa.retrieval import load_or_build, search
+from fa.config import KNOWLEDGE_DIR
+from fa.retrieval import chunk_markdown, search
+from fa.retrieval.index import SearchIndex
 from eval.retrieval import LITERAL, PARAPHRASED
 
 
@@ -35,7 +36,11 @@ def index():
     **不带 embedder** —— 这条测试必须在装了 chromadb 和没装 chromadb 的机器上
     给出同样的结果。带了的话，同一份断言在两种机器上会不一样。
     """
-    return load_or_build(KNOWLEDGE_DIR, KNOWLEDGE_INDEX)
+    # 期望值来自随仓库提交的12篇顶层MD。用户上传的PDF/PPT/图片会改变
+    # 词频与排名，不属于这份固定基线；新格式另有解析及检索用例。
+    chunks = [chunk for path in sorted(KNOWLEDGE_DIR.glob("*.md"))
+              for chunk in chunk_markdown(path.read_text(encoding="utf-8"), path.name)]
+    return SearchIndex().build(chunks, fingerprint="fixed-markdown-baseline")
 
 
 def file_at_1(index, cases) -> int:
